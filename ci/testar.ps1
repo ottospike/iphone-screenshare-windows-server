@@ -1,0 +1,48 @@
+# Teste de fumaca no Windows do CI, fora do MSYS2 (PATH limpo, como no PC de quem usa):
+# 1) o bundle acha todos os elementos do GStreamer que o UxPlay usa;
+# 2) o uxplay.exe sobe e continua no ar;
+# 3) o EspelhoIphone.exe extrai o bundle sozinho e mantem o uxplay rodando.
+$ErrorActionPreference = 'Stop'
+$b = Resolve-Path 'build/uxplay'
+$env:PATH = "$b\bin;C:\Windows\System32;C:\Windows"
+$env:GST_PLUGIN_SYSTEM_PATH_1_0 = "$b\lib\gstreamer-1.0"
+$env:GST_PLUGIN_PATH_1_0 = "$b\lib\gstreamer-1.0"
+$env:GST_PLUGIN_SCANNER_1_0 = "$b\libexec\gstreamer-1.0\gst-plugin-scanner.exe"
+$env:GST_REGISTRY_1_0 = "$env:RUNNER_TEMP\registry.bin"
+$env:FONTCONFIG_FILE = "$b\etc\fonts\fonts.conf"
+
+$elementos = 'queue appsrc playbin decodebin h264parse h265parse avdec_h264 avdec_h265 avdec_aac avdec_alac ' +
+  'videoconvert videoscale videoflip imagefreeze textoverlay jpegdec audioconvert audioresample volume level ' +
+  'autovideosink autoaudiosink d3d11videosink'
+$faltando = @()
+foreach ($e in $elementos.Split(' ')) {
+  & "$b\bin\gst-inspect-1.0.exe" --exists $e
+  if ($LASTEXITCODE -ne 0) { $faltando += $e }
+}
+if ($faltando) { throw "Elementos do GStreamer faltando no bundle: $($faltando -join ', ')" }
+Write-Host 'GStreamer: todos os elementos presentes'
+
+function Espera-UxPlay([int]$segundos) {
+  Start-Sleep -Seconds $segundos
+  $p = Get-Process uxplay -ErrorAction SilentlyContinue
+  if (-not $p) { throw "uxplay nao esta rodando depois de $segundos s" }
+  Write-Host "uxplay no ar (pid $($p.Id -join ','))"
+}
+
+$log = "$env:RUNNER_TEMP\uxplay.log"
+$ux = Start-Process "$b\bin\uxplay.exe" -ArgumentList '-n','CI','-nh','-s','1920x1080','-fps','60' `
+  -RedirectStandardOutput $log -RedirectStandardError "$log.err" -PassThru
+try { Espera-UxPlay 15 } finally {
+  Stop-Process -Id $ux.Id -Force -ErrorAction SilentlyContinue
+  Get-Content $log, "$log.err" -ErrorAction SilentlyContinue | Select-Object -First 60
+}
+
+Remove-Item Env:GST_*, Env:FONTCONFIG_FILE
+$env:PATH = 'C:\Windows\System32;C:\Windows'
+$app = Start-Process 'dist/EspelhoIphone.exe' -PassThru
+try { Espera-UxPlay 40 } finally {
+  Get-Content "$env:LOCALAPPDATA\EspelhoIphone\espelho.log" -ErrorAction SilentlyContinue | Select-Object -Last 40
+  Stop-Process -Id $app.Id -Force -ErrorAction SilentlyContinue
+  Get-Process uxplay -ErrorAction SilentlyContinue | Stop-Process -Force
+}
+Write-Host 'OK'
