@@ -1,4 +1,4 @@
-module espelho-iphone
+module iphone-screenshare-windows-server
 
 go 1.26.4
 

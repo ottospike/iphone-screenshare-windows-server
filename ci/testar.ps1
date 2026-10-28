@@ -1,7 +1,7 @@
 # Teste de fumaca no Windows do CI, fora do MSYS2 (PATH limpo, como no PC de quem usa):
 # 1) o bundle acha todos os elementos do GStreamer que o UxPlay usa;
 # 2) o uxplay.exe sobe e continua no ar;
-# 3) o EspelhoIphone.exe extrai o bundle sozinho e mantem o uxplay rodando.
+# 3) o iPhoneScreenshareServer.exe extrai o bundle sozinho e mantem um uxplay por slot (2 por padrao).
 $ErrorActionPreference = 'Stop'
 $b = Resolve-Path 'build/uxplay'
 $env:PATH = "$b\bin;C:\Windows\System32;C:\Windows"
@@ -22,10 +22,10 @@ foreach ($e in $elementos.Split(' ')) {
 if ($faltando) { throw "Elementos do GStreamer faltando no bundle: $($faltando -join ', ')" }
 Write-Host 'GStreamer: todos os elementos presentes'
 
-function Espera-UxPlay([int]$segundos) {
+function Espera-UxPlay([int]$segundos, [int]$quantos = 1) {
   Start-Sleep -Seconds $segundos
-  $p = Get-Process uxplay -ErrorAction SilentlyContinue
-  if (-not $p) { throw "uxplay nao esta rodando depois de $segundos s" }
+  $p = @(Get-Process uxplay -ErrorAction SilentlyContinue)
+  if ($p.Count -lt $quantos) { throw "esperava $quantos uxplay rodando depois de $segundos s, achei $($p.Count)" }
   Write-Host "uxplay no ar (pid $($p.Id -join ','))"
 }
 
@@ -39,9 +39,9 @@ try { Espera-UxPlay 15 } finally {
 
 Remove-Item Env:GST_*, Env:FONTCONFIG_FILE
 $env:PATH = 'C:\Windows\System32;C:\Windows'
-$app = Start-Process 'dist/EspelhoIphone.exe' -PassThru
-try { Espera-UxPlay 40 } finally {
-  Get-Content "$env:LOCALAPPDATA\EspelhoIphone\espelho.log" -ErrorAction SilentlyContinue | Select-Object -Last 40
+$app = Start-Process 'dist/iPhoneScreenshareServer.exe' -PassThru
+try { Espera-UxPlay 40 2 } finally {
+  Get-Content "$env:LOCALAPPDATA\iPhoneScreenshareServer\espelho.log" -ErrorAction SilentlyContinue | Select-Object -Last 40
   Stop-Process -Id $app.Id -Force -ErrorAction SilentlyContinue
   Get-Process uxplay -ErrorAction SilentlyContinue | Stop-Process -Force
 }

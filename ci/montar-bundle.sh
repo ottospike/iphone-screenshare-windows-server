@@ -21,6 +21,9 @@ PLUGINS=(
 rm -rf build && mkdir -p build && cd build
 git clone --quiet https://github.com/FDH2/UxPlay src
 git -C src checkout --quiet "$UXPLAY_REF"
+# Log sem buffer: o app le "connection request ... deviceID" na hora para prender o iPhone ao slot.
+sed -i 's/^int main (int argc, char \*argv\[\]) {$/&\n    setvbuf(stdout, NULL, _IONBF, 0);/' src/uxplay.cpp
+grep -c '_IONBF' src/uxplay.cpp
 cmake -S src -B obj -G Ninja -DCMAKE_BUILD_TYPE=Release   # sem -DUSE_DNS_SD: usa lib/mdnsd
 ninja -C obj
 

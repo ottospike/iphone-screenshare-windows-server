@@ -46,20 +46,20 @@ jobs:
         with:
           go-version-file: go.mod
 
-      - name: Compilar EspelhoIphone.exe
-        run: go build -ldflags "-H windowsgui -s -w" -o dist/EspelhoIphone.exe .
+      - name: Compilar iPhoneScreenshareServer.exe
+        run: go build -ldflags "-H windowsgui -s -w" -o dist/iPhoneScreenshareServer.exe .
 
       - name: Teste de fumaca
         run: ./ci/testar.ps1
 
       - uses: actions/upload-artifact@v4
         with:
-          name: EspelhoIphone
-          path: dist/EspelhoIphone.exe
+          name: iPhoneScreenshareServer
+          path: dist/iPhoneScreenshareServer.exe
 
       - name: Publicar release
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/EspelhoIphone.exe
+          files: dist/iPhoneScreenshareServer.exe
           generate_release_notes: true
