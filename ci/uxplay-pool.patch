@@ -1,0 +1,158 @@
+diff --git a/lib/mdnsd/mdnsd.c b/lib/mdnsd/mdnsd.c
+index 97a1ba6..dca6bf2 100644
+--- a/lib/mdnsd/mdnsd.c
++++ b/lib/mdnsd/mdnsd.c
+@@ -1140,6 +1140,50 @@ void mdnsd_announce(mdnsd_t *mdnsd, uint32_t ttl)
+     MUTEX_UNLOCK(mdnsd->mutex);
+ }
+ 
++/* iPhone Screenshare pool patch: several UxPlay instances on this host use the same service name,
++ * so the _airplay._tcp PTR (-> name._airplay._tcp), the _services._dns-sd._udp PTRs and the host's
++ * A/AAAA records are the same as the free instance's. A goodbye only says that this instance's own
++ * SRV and TXT are gone, without the cache-flush bit, which would remove the free instance's too, plus
++ * the _raop._tcp PTR, whose target (MAC@name, from -m) belongs to this instance alone. */
++static void mdns_send_goodbye_locked(mdnsd_t *mdnsd, const mdnsd_service_t *service,
++                                     mdns_family_t family)
++{
++    mdns_packet_t packet;
++    size_t count_pos;
++    size_t rdlength_pos;
++    unsigned int answers;
++
++    if (!service->registered || mdns_begin_response(&packet, &count_pos)) {
++        return;
++    }
++    if (mdns_begin_rr(&packet, service->name, DNS_TYPE_SRV, DNS_CLASS_IN, 0, &rdlength_pos) ||
++        mdns_put_u16(&packet, 0) ||
++        mdns_put_u16(&packet, 0) ||
++        mdns_put_u16(&packet, service->port) ||
++        mdns_put_name(&packet, mdnsd->host_name)) {
++        return;
++    }
++    mdns_end_rr(&packet, rdlength_pos);
++    if (mdns_begin_rr(&packet, service->name, DNS_TYPE_TXT, DNS_CLASS_IN, 0, &rdlength_pos) ||
++        mdns_put_bytes(&packet, service->txt.bytes, (size_t) service->txt.length)) {
++        return;
++    }
++    mdns_end_rr(&packet, rdlength_pos);
++    answers = 2;
++    if (strcmp(service->type, "_raop._tcp.local") == 0) {
++        if (mdns_add_ptr(&packet, service->type, service->name, 0)) {
++            return;
++        }
++        answers++;
++    }
++    mdns_finish_response(&packet, count_pos, answers);
++    if (family == MDNS_FAMILY_IPV4) {
++        mdns_send_packet4(mdnsd, &packet, NULL);
++    } else {
++        mdns_send_packet6(mdnsd, &packet, NULL);
++    }
++}
++
+ void mdnsd_goodbye(mdnsd_t *mdnsd, const mdnsd_service_t *service)
+ {
+     if (!mdnsd || !service) {
+@@ -1147,7 +1191,7 @@ void mdnsd_goodbye(mdnsd_t *mdnsd, const mdnsd_service_t *service)
+     }
+ 
+     MUTEX_LOCK(mdnsd->mutex);
+-    mdns_send_service_locked(mdnsd, service, 0, 0, MDNS_FAMILY_IPV4, NULL);
+-    mdns_send_service_locked(mdnsd, service, 0, 0, MDNS_FAMILY_IPV6, NULL);
++    mdns_send_goodbye_locked(mdnsd, service, MDNS_FAMILY_IPV4);
++    mdns_send_goodbye_locked(mdnsd, service, MDNS_FAMILY_IPV6);
+     MUTEX_UNLOCK(mdnsd->mutex);
+ }
+diff --git a/uxplay.cpp b/uxplay.cpp
+index 71cd44d..e1b9c18 100644
+--- a/uxplay.cpp
++++ b/uxplay.cpp
+@@ -2845,14 +2845,66 @@ extern "C" void video_process (void *cls, raop_ntp_t *ntp, video_decode_struct *
+     }
+ }
+ 
+-#ifdef DBUS
++/* iPhone Screenshare pool patch: an instance that is mirroring removes its mDNS advertisement, so the
++ * next device only sees the free instance, and adds it again when mirroring stops. Every instance
++ * has the same service name and announces with the cache-flush bit, so the devices then resolve
++ * the name to this instance (it announced last): the app takes it as the free one and takes down
++ * the other idle one. If announcing again fails, it stays hidden and the app restarts it.
++ * mirror_video_running() is called from RAOP threads (stream setup, and the end of the mirror thread);
++ * the dnssd calls are not thread-safe, so they run on the GLib main loop, the thread that also does
++ * the first register_dnssd() and the final stop_dnssd(). Each call queues its own event, in order. */
++static bool dnssd_mirror_hidden = false;  /* main thread only */
++
++/* One announcement can be lost (multicast on Wi-Fi), and the app kills the other idle instance
++ * without a goodbye about 5-6 s after this one announces: announce again at +1 s, +3 s and +8 s
++ * (RFC 6762 8.3), so a cache-flush SRV/TXT sent more than 1 s after the other instance's answers
++ * replaces them. register_dnssd() on registered services rebuilds the TXT and announces again.
++ * Each repeat is logged, so the app times "announced last" from the last packet sent. */
++static gboolean dnssd_announce_again (gpointer data) {
++    (void) data;
++    if (dnssd && !dnssd_mirror_hidden && register_dnssd() == 0) {
++        LOGI("mDNS: announced again");
++    }
++    return G_SOURCE_REMOVE;
++}
++
++static void dnssd_announce_repeats () {
++    g_timeout_add(1000, dnssd_announce_again, NULL);
++    g_timeout_add(3000, dnssd_announce_again, NULL);
++    g_timeout_add(8000, dnssd_announce_again, NULL);
++}
++
++static gboolean dnssd_mirror_apply (gpointer data) {
++    bool running = (GPOINTER_TO_INT(data) != 0);
++    if (!dnssd) {
++        return G_SOURCE_REMOVE;
++    }
++    if (running && !dnssd_mirror_hidden) {
++        unregister_dnssd();
++        dnssd_mirror_hidden = true;
++        LOGI("mDNS: hidden while mirroring");
++    } else if (!running && dnssd_mirror_hidden) {
++        if (register_dnssd() == 0) {
++            dnssd_mirror_hidden = false;
++            LOGI("mDNS: mirroring ended, advertised again");
++            dnssd_announce_repeats();
++        } else {
++            unregister_dnssd();  /* a service registered before the failure: hidden for real */
++            LOGI("mDNS: mirroring ended, advertising again failed: still hidden");
++        }
++    }
++    return G_SOURCE_REMOVE;
++}
++
+ extern "C" void mirror_video_running  (void *cls, bool is_running) {
++    g_idle_add(dnssd_mirror_apply, GINT_TO_POINTER(is_running ? 1 : 0));
++#ifdef DBUS
+     if (scrsv != 1) {
+         return;
+     }
+     dbus_screensaver_inhibiter(is_running);
+-}
+ #endif
++}
+ 
+ extern "C" void video_pause (void *cls) {
+     if (use_video) {
+@@ -3201,9 +3253,7 @@ static int start_raop_server (unsigned short display[5], unsigned short tcp[3],
+     raop_cbs.export_dacp = export_dacp;
+     raop_cbs.video_reset = video_reset;
+     raop_cbs.video_set_codec_and_size = video_set_codec_and_size;
+-#ifdef DBUS
+     raop_cbs.mirror_video_running = mirror_video_running;
+-#endif
+     raop_cbs.on_video_play = on_video_play;
+     raop_cbs.on_video_scrub = on_video_scrub;
+     raop_cbs.on_video_rate = on_video_rate;
+@@ -3755,6 +3805,9 @@ int main (int argc, char *argv[]) {
+         stop_raop_server();
+         stop_dnssd();
+         cleanup();
++    } else {
++        LOGI("mDNS: advertised at startup");  /* iPhone Screenshare pool patch: the app's "ready" */
++        dnssd_announce_repeats();
+     }
+     reconnect:
+     compression_type = 0;

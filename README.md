@@ -7,9 +7,9 @@ Under the hood it runs [UxPlay](https://github.com/FDH2/UxPlay), an open source 
 with its own embedded mDNS, so devices find the PC without Apple's Bonjour. The app lives in the
 Windows tray, keeps UxPlay running and restarts it if it crashes.
 
-Several devices at once, each in its own **slot**: the device that connected to LIVE 1 is bound to
-it and, if it drops and reconnects, it comes back to LIVE 1, on the same OBS source. There is
-always a free LIVE for the next device.
+Several devices at once, all through **one entry**: everyone taps **LIVE** in Screen Mirroring.
+Each device gets its own video window, **named after the device**, so each OBS source follows its
+person, across reconnects and app restarts.
 
 ## Download
 
@@ -28,45 +28,54 @@ If Windows warns about the file the first time:
    - it extracts UxPlay to `%LOCALAPPDATA%\iPhoneScreenshareServer\` (a few seconds);
    - Windows asks for administrator rights to open the firewall: once per version, on the first
      run after an update.
-2. On the device: **Control Center → Screen Mirroring → LIVE 1**. The next device sees **LIVE 2**,
-   then **LIVE 3**, and so on.
-3. In OBS, one source per slot (see [OBS setup](#obs-setup)).
+2. On each device: **Control Center → Screen Mirroring → LIVE**. Every device taps the same LIVE.
+3. In OBS, one source per device, by the device's name (see [OBS setup](#obs-setup)).
 
-## Dynamic slots
+## One LIVE for everyone
 
-There is always one **free LIVE N** in Screen Mirroring. The device that connects to it is
-**bound** to the slot by its AirPlay `deviceID`. The binding is saved in the config and survives
-app and PC restarts. The app then announces the next free one, up to `maxSlots` (default 8).
+The app runs a pool of UxPlay instances, up to `maxSlots` (default 8), all with the same name.
+Exactly one of them is free and announced as **LIVE**:
 
-- Every device sees **all** running LIVE N. Slots bound to other devices refuse the connection
-  (the log shows `refused <device>`); a device uses its own LIVE or the current free one.
-- Each slot is a separate AirPlay receiver with its own name, ports and MAC address, so the
-  device lists them as different receivers.
-- On the free slot the first device keeps the screen: a second device tapping the same LIVE is
-  refused and uses the next LIVE, instead of dropping the first.
-- Locks apply when nobody is mirroring on the slot (the app restarts that slot's UxPlay in the
-  background), so nobody live is dropped.
-- To give a slot to another device: tray menu → `LIVE N` → **Unbind this slot**. A device still
-  mirroring stays live until it stops; the slot then becomes free again. The unbound device is not
-  rebound to the same slot until the slot restarts.
-- A device that gets into a slot that isn't its own, before the locks apply, is dropped at once:
-  the slot restarts with the locks.
-- When all slots up to `maxSlots` are bound there is no free LIVE; the tray says so. Unbind one.
-- `"maxSlots": 1` is single mode: one **LIVE**, no binding, any device connects.
+- When a device connects to LIVE, that instance is the device's for the session, and the app
+  brings up the next free one right away for the next device.
+- While a device mirrors, its instance takes itself out of Screen Mirroring (UxPlay is patched
+  for this, see [How it works](#how-it-works)), so other devices only see the free LIVE and can't
+  take over someone's screen. When it stops mirroring, the instance puts itself back in Screen
+  Mirroring as LIVE. All instances share the name, so devices now reach LIVE on this instance:
+  it becomes the free one, and the previous free one goes down about 5 s later. It announces
+  itself a few more times over the next 8 s, so a device that missed one announcement still finds
+  it. If Resolution or FPS changed while it was live, it restarts right then with the new settings,
+  before the next device takes it. If UxPlay can't announce itself again, the instance stays out of
+  Screen Mirroring and restarts when it is needed.
+- Each instance has its own ports and MAC address; the window, the tray line and the log say
+  which device is on it.
+- When `maxSlots` devices are live there is no free LIVE; the tray says so. Devices may still list
+  LIVE for a while then, but tapping it fails until a session ends.
+- Only Screen Mirroring is supported: AirPlay video (e.g. from YouTube) or audio sent to LIVE does
+  not take the instance out of Screen Mirroring.
+- A device that reconnects (Wi-Fi blip) while its old session still counts as live is taken by the
+  free LIVE, and its old instance restarts at once, so there is never a frozen copy of its window.
 
 ## OBS setup
 
-One **Window Capture** source per slot: **Sources → + → Window Capture**.
+One **Window Capture** source per device: **Sources → + → Window Capture**.
 
-- **Window**: `[uxplay.exe]: Slot 1` (and `Slot 2`, `Slot 3`… in the other sources). The window
-  only exists while a device mirrors: connect once so it shows in the list.
+- **Window**: `[uxplay.exe]: <device name>`, e.g. `[uxplay.exe]: Otavio Augusto’s iPhone`: the
+  label you gave the device in the config if any, otherwise the name the device sends. The window
+  only exists while the device mirrors: connect it once so it shows in the list.
 - **Capture Method**: **Windows 10 (1903 and up)**, with **Client area** checked: only the video
   is captured, without the title bar, buttons or borders.
-- **Window Match Priority**: **Window title must match**. The window closes when the slot
-  restarts and comes back with the same title, so each source always finds its own slot.
+- **Window Match Priority**: **Window title must match**. The title is the same every time the
+  device connects, whatever instance it lands on, so the source always finds its person.
 - Right-click the source → **Transform → Edit Transform** → **Bounding Box Type**:
   **Scale to inner bounds**, and set the bounding box size to the area you want. The source then
   fits portrait and landscape automatically when the device rotates.
+
+Two devices with the same name (two `iPhone`s) get `iPhone` and `iPhone 2`, and each keeps its
+title: the app remembers it per device. Give them a `label` in the config to tell them apart.
+
+**Coming from v0.2.0** (sources on `Slot 1`, `Slot 2`…): connect each device once, then open each
+source and pick the device's window instead of `Slot N`. Only once: from then on the title stays.
 
 The video window:
 
@@ -81,43 +90,45 @@ The video window:
   transparent from the moment it is created until it has been fitted, a few milliseconds after it
   is shown. You can resize it by hand; the app fits it again on every rotation and when a device
   reconnects.
+- Only the video window itself (GStreamer's `GSTD3D11` window, from the d3d11videosink the app runs UxPlay with) is fitted and renamed:
+  the close button's tooltip and other small windows of UxPlay are left alone.
 - Quality comes from what the device sends (**Native**: its own resolution). The window only
   needs to show the whole video, and it may be smaller than the video: OBS captures the whole
   picture, at the window's size.
 
 ### Audio
 
-Audio is always on. Each slot plays its device's sound on the PC's default output and is also a
-separate audio app that OBS can capture:
+Audio is always on. Each device's sound plays on the PC's default output and is also a separate
+audio app that OBS can capture:
 
-- Add **Sources → + → Application Audio Capture**, pick `[uxplay.exe]: Slot N` and set
+- Add **Sources → + → Application Audio Capture**, pick `[uxplay.exe]: <device name>` and set
   **Window Match Priority** to **Window title must match**, the same as for Window Capture.
-- Mute or unmute each slot in the OBS **Audio Mixer**.
+- Mute or unmute each device in the OBS **Audio Mixer**.
 - Since the sound also plays on the PC's default output, mute **Desktop Audio** in OBS, or set
-  it to another device, to avoid capturing every slot twice.
+  it to another device, to avoid capturing every device twice.
 - AirPlay has 100–200 ms of latency; adjust **Sync Offset** in Advanced Audio Properties if needed.
 
 ## Tray menu
 
 | Item | What it does |
 |---|---|
-| First line | How many slots are bound, or that all are bound; with `maxSlots` 1, `Single LIVE · any device` |
-| `LIVE 2 · <device> · <state> · H.265 · portrait 1320×2868` | One per running slot: bound device or `free`, state, and while live the codec, H.264 or H.265, the orientation and the real source resolution, updated on every rotation. Submenu: **Unbind this slot** |
-| **Resolution** | Native · FHD · HD · SD, for all slots. Saved; each slot's UxPlay restarts with it once nobody is mirroring on it, so live devices are not dropped |
-| **FPS** | 60 · 30, for all slots. Saved; applied the same way |
-| **Restart** | Rereads the config and restarts every slot. If the config has an error or can't be read, nothing restarts and live devices stay connected |
+| First line | How many devices are live and the limit, or that it is full |
+| `Otavio Augusto’s iPhone · live · H.265 · portrait 1325×2880 · 60 fps` | One per device: its name (the window title), state, and while live the codec, the orientation and the real source resolution, updated on every rotation, and the frame rate the device reports it sends. After a Resolution/FPS change, e.g. `· SD on reconnect` until its instance restarts. Submenu: **Apply now**, shown while a change waits for this device, ends its session and restarts its instance with the new settings, then tap LIVE again on the device; **Forget device** removes it from the remembered devices |
+| `LIVE · waiting` | The free instance, for the next device |
+| **Resolution** | Native · FHD · HD · SD, for all instances. Saved; each instance restarts with it once nobody is mirroring on it, so live devices are not dropped |
+| **FPS** | 60 · 30, for all instances. Saved; applied the same way |
+| **Restart** | Rereads the config and restarts every instance. If the config has an error or can't be read, nothing restarts and live devices stay connected |
 | **Open log** | App and UxPlay log in Notepad |
 | **Open config** | `config.json` in Notepad |
 | **Quit** | Closes the app and UxPlay |
 
-Slot states: `starting` gray · `waiting` blue · `connecting` yellow · `live` green ·
+States: `starting` gray · `waiting` blue · `connecting` yellow · `live` green ·
 `stopped: mirror again on the device` yellow, the window keeps the last frame ·
 `receiving video but no window` yellow · `reconnecting` yellow, UxPlay crashed and is coming back ·
 `start error` / `stopped: crashed 3 times` red.
 
-The tray icon is **red** if any slot has an error, else **green** if any device is live, else
-**yellow** if a slot needs attention, else **blue**. Hover it to see how many are live and which
-LIVE is free.
+The tray icon is **red** if any instance has an error, else **green** if any device is live, else
+**yellow** if one needs attention, else **blue**. Hover it to see how many are live.
 
 ## Resolution and FPS
 
@@ -137,36 +148,42 @@ so it sends roughly its own resolution, and it still fits an iPad Pro's 2752 at 
 | **HD** | `-s 1280x1280` | H.264, longest side up to 1280. Weak Wi-Fi or many devices at once |
 | **SD** | `-s 854x854` | H.264, longest side up to 854. Very weak Wi-Fi, last resort |
 
-**FPS** sets the maximum frame rate (`-fps 60` or `-fps 30`). 30 lowers bandwidth and CPU.
-A change applies to each slot as soon as nobody is mirroring on it: a live device keeps its current
-settings until it stops mirroring, or use **Restart** to apply it everywhere now.
-The codec and the actual source size of each slot are shown in the tray menu and in the log.
+**FPS** sets the maximum frame rate (`-fps 60` or `-fps 30`). 30 lowers bandwidth and CPU. It is a
+maximum: the device may send fewer frames, and the tray shows what it actually sends, from the
+reports it makes once a second (UxPlay's `-FPSdata`). The first report of each session is written
+to the log, the ones after it are not.
+
+A change applies to each instance as soon as nobody is mirroring on it: a live device keeps its
+current settings, and its tray line says what it gets on reconnect, e.g. `SD on reconnect`, until
+it stops mirroring. **Apply now** in its submenu ends that device's session and restarts its
+instance with the new settings; tap LIVE again on the device. **Restart** applies it everywhere.
 
 ## When the connection drops
 
 | What happens | What the app does |
 |---|---|
-| Device Wi-Fi blips | Mirror again on the device. A bound slot accepts it at once (`-nohold`), without waiting for the old session to expire |
-| Device disappears without notice | UxPlay drops the session after 15 s without response; the window keeps the last frame |
-| UxPlay exits or crashes | Restarts in 2 s. If it crashes 3 times in a row right after starting, it stops and warns once, to avoid a loop: check the log, then change **Resolution** or **FPS**, which starts the stopped slots again, or use **Restart** |
-| PC network changes: cable/Wi-Fi back, new IP | Restarts the slots nobody is mirroring on, so they announce on the new network. Live ones continue |
+| Device Wi-Fi blips | Mirror again to LIVE on the device. The free instance takes it, with the same window title, and the old instance restarts at once |
+| Device disappears without notice | UxPlay drops the session after 15 s without response and the instance is LIVE again; its window may keep the last frame, under the device's name, until another device connects to it, or the instance restarts when the same device reconnects on another one |
+| UxPlay exits or crashes | Restarts in 2 s. If it crashes 3 times in a row right after starting, it stops and warns once, to avoid a loop: check the log, then change **Resolution** or **FPS**, which starts the stopped instances again, or use **Restart** |
+| PC network changes: cable/Wi-Fi back, new IP | Restarts the instances nobody is mirroring on, so they announce on the new network. Live ones continue |
 | PC resumes from sleep | Same |
 | App started twice | Asks whether to close the running copy, whose icon may be hidden under the tray ^ arrow. **Yes** closes it and starts the new one |
 
 No receiver can make the device resume mirroring by itself: when mirroring drops, the device ends
-it on its side. Tap **Screen Mirroring → LIVE N** again; it returns to the same slot and OBS source.
+it on its side. Tap **Screen Mirroring → LIVE** again; its window comes back with the same title,
+on the same OBS source.
 
 ## Config
 
 `%LOCALAPPDATA%\iPhoneScreenshareServer\config.json` (tray → Open config). After editing, use
-**Restart**. If the app needs to save, for example a new binding, before you press **Restart**, it
+**Restart**. If the app needs to save, for example a new device, before you press **Restart**, it
 reads your edit first and keeps it. If the file has an error, such as an extra comma, the app warns
 and applies nothing, without touching the file. If the error is there at startup, the app runs with
 the defaults in memory, saves a copy to `config.json.broken` and doesn't overwrite your file; once
 you fix it, the app reads it again by itself, or use **Restart**. If the file can't be read, such as
 when another program has it locked, the app doesn't overwrite it either and tries to read it again
-every 5 s. Changes made in the tray meanwhile, bindings, unbinds, **Resolution** and **FPS**, are
-merged into the file when it reads fine, unless the file changed that same slot, device or setting.
+every 5 s. Changes made in the app meanwhile, new and forgotten devices, **Resolution** and **FPS**,
+are merged into the file when it reads fine, unless the file changed that same device or setting.
 If a save fails, for example because the file is read-only, the app keeps the changes in memory,
 retries with a growing delay and warns once. The file is saved atomically, so a crash or power loss
 never leaves it cut off, and a copy of the last save is kept in `config.json.bak`.
@@ -179,28 +196,31 @@ never leaves it cut off, and a copy of the last save is kept in `config.json.bak
   "fps": 60,
   "uxplay": "",
   "extraArgs": [],
-  "bindings": {
-    "1": { "deviceID": "AA:BB:CC:DD:EE:FF", "device": "Jane's iPhone" }
+  "devices": {
+    "22:C5:83:7E:F0:3F": { "name": "Otavio Augusto’s iPhone", "label": "", "window": "Otavio Augusto’s iPhone" },
+    "AA:BB:CC:DD:EE:FF": { "name": "iPhone", "label": "Player 2", "window": "Player 2" }
   }
 }
 ```
 
 | Key | Purpose |
 |---|---|
-| `name` | Name shown in Screen Mirroring: `LIVE 1`, `LIVE 2`…; with `maxSlots` 1, just `LIVE` |
-| `maxSlots` | Max devices at once, 1 to 8. 1 = a single LIVE, no binding |
+| `name` | The one name shown in Screen Mirroring |
+| `maxSlots` | Max devices at once, 1 to 8 |
 | `resolution` | `native`, `fhd`, `hd` or `sd`, see [Resolution and FPS](#resolution-and-fps) |
 | `fps` | `60` or `30` |
-| `uxplay` | Path to another `uxplay.exe`. Empty = the embedded one |
-| `extraArgs` | Extra UxPlay options for every slot, added last so they override the app's. E.g. `["-reset", "30"]` to tolerate 30 s without response before dropping the session |
-| `bindings` | Which device is bound to each slot. Filled by the app; deleting an entry unbinds it. Bindings above `maxSlots` are ignored |
+| `uxplay` | Path to another `uxplay.exe`. Empty = the embedded one. It needs the pool patch to hide busy instances |
+| `extraArgs` | Extra UxPlay options for every instance, added last so they override the app's. E.g. `["-reset", "30"]` to tolerate 30 s without response before dropping the session |
+| `devices` | Remembered devices, by the `deviceID` they send over AirPlay. Filled by the app: `name` is what the device sends, `window` the window title it got (kept so it never changes). Set `label` to name the device yourself, e.g. `"Player 2"`: it replaces the name in the window title and the tray from its next connection, so re-point its OBS source once. Deleting an entry, or **Forget device**, frees its title |
 
-Configs from earlier versions with Portuguese keys (`nome`, `slots`, `qualidade`, `argsExtras`,
-`vinculos`) are converted automatically, bindings included: `FHD` becomes `native`, `HD` becomes
-`hd`. The original file is kept as `config.json.v1`; to go back to an older version, restore it
-as `config.json`, since older versions don't read the new keys. If an older version is started by
-mistake, it rewrites `config.json` without the new settings; the next start of this version
-restores them from `config.json.bak` and keeps any device the older version bound.
+Configs of earlier versions are converted automatically. v0.2.0's slot `bindings` become
+`devices`, so bound devices are remembered (the original file is kept as `config.json.v2`). The
+Portuguese keys of the first versions (`nome`, `slots`, `qualidade`, `argsExtras`, `vinculos`) are
+converted too: `FHD` becomes `native`, `HD` becomes `hd`, and the original file is kept as
+`config.json.v1`. To go back to an older version, restore that file as `config.json`, since older
+versions don't read the new keys. If a Portuguese-era version is started by mistake, it rewrites
+`config.json` without the new settings; the next start of this version restores them from
+`config.json.bak` and keeps any device the older version bound.
 
 Separately, the `resolution` values `1920` and `1280` of earlier English versions become `fhd`
 and `hd`, and an unknown value becomes `native`.
@@ -217,12 +237,12 @@ and `hd`, and an unknown value becomes `native`.
 |---|---|
 | SmartScreen "Windows protected your PC" | **More info → Run anyway**, or **Unblock** in the file's Properties. Signed releases build SmartScreen reputation over time |
 | "Already running" at startup | Answer **Yes** to replace it. If it says the running copy is an older version or runs as administrator, quit it from its tray menu and start again |
-| LIVE doesn't show on the device | Same network? Guest networks and router "client isolation" block it. Check the rule "iPhone Screenshare Windows Server v2" in *Windows Firewall → Inbound Rules*; it covers Private and Public, local subnet only |
-| Only one LIVE shows but the menu lists several | Not normal: every device should see all running LIVE. Check network/firewall and that the app is up to date |
-| Tapping LIVE doesn't connect | If the slot belongs to another device this is expected: the log shows `refused <device>`. Use your LIVE or the free one |
-| Device connects but OBS is black / no window | Open log: if `Begin streaming` shows and no `Slot N` window, use **Restart**; check that OBS uses `[uxplay.exe]: Slot N` |
+| LIVE doesn't show on the device | Same network? Guest networks and router "client isolation" block it. Check the rule "iPhone Screenshare Windows Server v2" in *Windows Firewall → Inbound Rules*; it covers Private and Public, local subnet only. If the tray says it is full, no LIVE is free |
+| Tapping LIVE doesn't connect | Wait a second and tap again: right after a device connects, the next free instance is still starting |
+| Device connects but OBS is black / no window | Open log: if `Begin streaming` shows and no window with the device's name, use **Restart**; check that OBS uses `[uxplay.exe]: <device name>` |
+| OBS source shows nothing after changing a label | The window title changed to the label: pick the new title in the source once |
 | Black in OBS with the right window | Is the window minimized? Restore it. Otherwise change the Window Capture method, or use Display Capture with a crop |
-| Stuttering video | Lower **Resolution** to FHD, HD or SD, or **FPS** to 30, then stop and start Screen Mirroring on that device: a live device keeps the old setting until it reconnects |
+| Stuttering video | Lower **Resolution** to FHD, HD or SD, or **FPS** to 30, then **Apply now** on that device, or stop and start Screen Mirroring on it |
 | Red icon | Open log; the last line says why |
 | Antivirus complains | Allow `%LOCALAPPDATA%\iPhoneScreenshareServer\` |
 
@@ -232,30 +252,53 @@ and `hd`, and an unknown value becomes `native`.
 iPhoneScreenshareServer.exe (Go, tray)
  ├─ embedded bundle/uxplay.zip ── extracted once ──> %LOCALAPPDATA%\iPhoneScreenshareServer\uxplay-<hash>\
  │                                                    bin\uxplay.exe + DLLs, GStreamer plugins
- ├─ per slot: uxplay.exe -n "LIVE N" -nh -p <slot ports> -m <slot MAC> -vs d3d11videosink
- │            -h265 -s 2880x2880 -fps 60   (Resolution/FPS from the tray)
- │            + bound: -restrict -allow <deviceID> -nohold; other slots: -block <deviceID>
- ├─ dynamic slots: one running per bound device plus one free, up to maxSlots
- ├─ reads UxPlay output: "connection request from <device> ... deviceID = <id>" and the accept → binds the slot;
+ ├─ per instance: uxplay.exe -n LIVE -nh -p <its ports> -m <its MAC> -vs d3d11videosink
+ │                -h265 -s 2880x2880 -fps 60 -FPSdata   (Resolution/FPS from the tray)
+ ├─ pool: one instance per live device plus exactly one free, up to maxSlots
+ ├─ reads UxPlay output: "connection request from <device> ... deviceID = <id>" and the accept → the
+ │                       device's window title, remembered in the config;
+ │                       "mDNS: advertised at startup" / "mDNS: hidden while mirroring" /
+ │                       "mDNS: mirroring ended, advertised again" (the patch);
  │                       "Begin streaming" / session end → live / stopped;
- │                       "codec is h264|h265: geometry is (w,h)=(…) (source)" → codec, orientation and size
- ├─ renames each UxPlay video window to "Slot N" (OBS finds the source by title)
+ │                       "codec is h264|h265: geometry is (w,h)=(…) (source)" → codec, orientation and size;
+ │                       the device's FPS report (a plist) → its frame rate
+ ├─ renames each video window to its device's name (OBS finds the source by title)
  ├─ window events: each new video window stays transparent until it is fitted to the video
  │                 (no black bars) at show, so it is first seen in shape; fitted again on rotation
  ├─ watches the process: crashed → restart; 3 quick crashes → stop and warn
- ├─ watches the network: IP changed or PC resumed → restarts idle slots
+ ├─ watches the network: IP changed or PC resumed → restarts idle instances
  └─ Windows job object: however the app exits, uxplay exits with it
 ```
 
 UxPlay and GStreamer are built in GitHub Actions (Windows + MSYS2 UCRT64) from a pinned commit of
-[FDH2/UxPlay](https://github.com/FDH2/UxPlay) (≥ 1.74, which has its own mDNS) with a one-line
-patch: unbuffered output, so the app sees at once which device connected. CI runs `go vet` and the
-tests (`main_test.go`) and tests the result on a clean Windows: all GStreamer elements present,
-`uxplay.exe` starting with each resolution preset, `iPhoneScreenshareServer.exe` extracting and
-keeping the free slot up, and, with a fake uxplay (`ci/fake-uxplay`) that simulates a device, the
-binding, the new slot, distinct MACs, the codec, geometry and rotation, a visible `Slot 1` window
-that, sized to the full video and then shown like the real video sink does, is first seen already
-in the portrait video's shape, and that window fitted to the landscape one after the rotation.
+[FDH2/UxPlay](https://github.com/FDH2/UxPlay) (≥ 1.74, which has its own mDNS) with two changes:
+unbuffered output, so the app sees at once which device connected, and the pool patch,
+[`ci/uxplay-pool.patch`](ci/uxplay-pool.patch). With the patch an instance removes its mDNS
+advertisement when a device starts mirroring and adds it again when mirroring stops, logging
+`mDNS: hidden while mirroring` and `mDNS: mirroring ended, advertised again` (and
+`mDNS: advertised at startup`, plus `mDNS: announced again` for each repeat at +1, +3 and +8 s);
+the change runs on UxPlay's main loop, since its mDNS code is not thread-safe. Every instance has
+the same name and announces with the cache-flush bit, so once an instance announces again after a
+session, the devices resolve LIVE to it: the app takes the end line as the end of the session,
+makes that instance the free one as it is (no restart, unless new settings wait for it) and takes
+the other idle instance down about 5 s later. If announcing again fails (`mDNS: mirroring ended, advertising again
+failed: still hidden`), the instance stays hidden and the app restarts it when it is needed. Its
+goodbye only withdraws its own records (SRV, TXT and its own `_raop` PTR), not the ones it shares
+with the free instance, and the app keeps as the free one the instance that is not hidden and
+announced itself last, timed from those log lines. The build fails if the patch doesn't apply
+to the pinned commit.
+
+CI runs `go vet` and the tests (`main_test.go`) and tests the result on a clean Windows: all
+GStreamer elements present, the patch compiled in, `uxplay.exe` starting with each resolution
+preset and `-FPSdata`, `iPhoneScreenshareServer.exe` extracting and keeping exactly one free
+instance up, and, with a fake uxplay (`ci/fake-uxplay`) that simulates a device: the device
+remembered, exactly one new free instance with its own MAC, the patch's mDNS lines (the end of
+the session read from the patch's line alone, then the ended instance, advertised again, kept as
+the one free instance without a restart and the other idle one down), the reported
+fps with only the first report in the log, the codec, geometry and rotation, a visible window named
+after the device that, sized to the full video and then shown like the real video sink does, is
+first seen already in the portrait video's shape and fitted to the landscape one after the
+rotation, and the close button's tooltip window left alone.
 
 The app sends no data anywhere. It only talks to devices on the local network over AirPlay.
 
@@ -274,7 +317,8 @@ The `.exe` comes from the [`build`](.github/workflows/build.yml) workflow:
   not approved by then, the job fails and the tag's workflow has to be re-run. Without the secret
   the build is unsigned and otherwise identical. The token is only passed to the job on `v*` tags.
 
-To update UxPlay, change `UXPLAY_REF` in the workflow to the new commit.
+To update UxPlay, change `UXPLAY_REF` in the workflow to the new commit and check that
+`ci/uxplay-pool.patch` still applies (`git apply --check`); the build stops if it doesn't.
 
 Locally (needs `bundle/uxplay.zip` from CI; to just compile and test, an empty zip works). The
 app is Windows-only: the tests run on Windows, and on other systems use `GOOS=windows` to vet and
@@ -289,8 +333,9 @@ GOOS=windows GOARCH=amd64 go build -ldflags "-H windowsgui -s -w" -o dist/iPhone
 | File | Role |
 |---|---|
 | `main.go` | Tray app |
-| `main_test.go` | Tests for slot rules, args, log parsing and config migration |
-| `ci/build-bundle.sh` | Builds UxPlay and `bundle/uxplay.zip` (in MSYS2) |
+| `main_test.go` | Tests for the pool, args, window titles, the window filter, log and FPS report parsing and config migration |
+| `ci/build-bundle.sh` | Builds UxPlay with `ci/uxplay-pool.patch` and `bundle/uxplay.zip` (in MSYS2) |
+| `ci/uxplay-pool.patch` | UxPlay patch: hidden from Screen Mirroring while mirroring |
 | `ci/smoke-test.ps1` | Smoke test on the CI Windows runner |
 | `ci/fake-uxplay/` | Fake uxplay that simulates a device, for the smoke test |
 

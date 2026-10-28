@@ -21,6 +21,21 @@ PLUGINS=(
 rm -rf build && mkdir -p build && cd build
 git clone --quiet https://github.com/FDH2/UxPlay src
 git -C src checkout --quiet "$UXPLAY_REF"
+# Pool patch: an instance removes its mDNS advertisement while a device mirrors and adds it again
+# when it stops ("mDNS: hidden while mirroring" / "mDNS: mirroring ended, advertised again" in the
+# log; the app then takes it as the free instance and takes the other idle one down), and its
+# goodbye leaves the records it shares with the other instances alone. Made for UXPLAY_REF:
+# after changing the ref, the build stops here until the patch is updated.
+tr -d '\r' < "$ROOT/ci/uxplay-pool.patch" > "$PWD/uxplay-pool.patch"   # a CRLF checkout of this repo
+if ! git -C src apply --check "$PWD/uxplay-pool.patch"; then
+  echo "ERROR: ci/uxplay-pool.patch does not apply to UxPlay $UXPLAY_REF; update the patch" >&2
+  exit 1
+fi
+git -C src apply "$PWD/uxplay-pool.patch"
+grep -q 'mDNS: hidden while mirroring' src/uxplay.cpp
+grep -q 'mDNS: mirroring ended, advertised again' src/uxplay.cpp
+
+grep -q 'mDNS: advertised at startup' src/uxplay.cpp
 # Unbuffered log: the app reads "connection request ... deviceID" right away to bind the device to its slot.
 sed -i 's/^int main (int argc, char \*argv\[\]) {$/&\n    setvbuf(stdout, NULL, _IONBF, 0);/' src/uxplay.cpp
 grep -c '_IONBF' src/uxplay.cpp

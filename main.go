@@ -2,8 +2,11 @@
 // running so OBS can capture its window. UxPlay and GStreamer are embedded in this .exe
 // (bundle/uxplay.zip, built by CI) and extracted on first run. It restarts UxPlay if it crashes and
 // stops retrying if it crashes in a loop (bad flag, port in use), pointing to the log.
-// Dynamic slots: there is always a free "LIVE N"; the device that connects to it is bound to the
-// slot (window "Slot N" in OBS) by its deviceID and a new free slot comes up for the next device.
+// A pool of UxPlay instances that all use the same name ("LIVE"): exactly one idle instance is
+// advertised for the next device. UxPlay is patched (ci/uxplay-pool.patch) to remove its mDNS
+// advertisement while a device mirrors and add it again when mirroring stops, so busy instances are
+// hidden and can't be taken over. The video window is named after the device (OBS follows the person),
+// stable for the same deviceID.
 package main
 
 import (
@@ -23,6 +26,7 @@ import (
 	"io"
 	"io/fs"
 	"maps"
+	"math"
 	"net"
 	"os"
 	"os/exec"
@@ -46,29 +50,32 @@ const (
 	// New rule name (v2 = any network profile, local subnet only); the old one is deleted with it.
 	firewallRule    = "iPhone Screenshare Windows Server v2"
 	oldFirewallRule = "iPhone Screenshare Windows Server"
-	slotLimit       = 8 // menu items created at startup; maxSlots in the config goes up to this
+	slotLimit       = 8 // instances (menu items created at startup); maxSlots in the config goes up to this
 	appTitle        = "iPhone Screenshare"
 )
 
 //go:embed bundle/uxplay.zip
 var bundleZip []byte
 
-type Binding struct {
-	DeviceID string `json:"deviceID"` // deviceID the device sends over AirPlay (UxPlay logs it)
-	Device   string `json:"device"`   // device name, display only
+// Device is a remembered device, keyed by the deviceID it sends over AirPlay (UxPlay logs it).
+type Device struct {
+	Name   string `json:"name"`             // name the device sends
+	Label  string `json:"label"`            // set by hand: replaces the name in the window title and the tray
+	Window string `json:"window,omitempty"` // window title it got last time (kept so it doesn't change)
 }
 
 type Config struct {
-	Name       string             `json:"name"`       // name in Screen Mirroring: becomes "LIVE 1", "LIVE 2"...
-	MaxSlots   int                `json:"maxSlots"`   // max devices at once (1 to 8); 1 = a single LIVE, no binding
-	Resolution string             `json:"resolution"` // "native", "fhd", "hd" or "sd"
-	FPS        int                `json:"fps"`        // 60 or 30
-	UxPlay     string             `json:"uxplay"`     // path to another uxplay.exe; empty = the embedded one
-	ExtraArgs  []string           `json:"extraArgs"`  // e.g. ["-reset", "30"]; added last, so they override the app's
-	Bindings   map[string]Binding `json:"bindings"`   // "1" -> device bound to slot 1
+	Name       string            `json:"name"`       // the one name in Screen Mirroring
+	MaxSlots   int               `json:"maxSlots"`   // max devices at once (1 to 8)
+	Resolution string            `json:"resolution"` // "native", "fhd", "hd" or "sd"
+	FPS        int               `json:"fps"`        // 60 or 30
+	UxPlay     string            `json:"uxplay"`     // path to another uxplay.exe; empty = the embedded one
+	ExtraArgs  []string          `json:"extraArgs"`  // e.g. ["-reset", "30"]; added last, so they override the app's
+	Devices    map[string]Device `json:"devices"`    // deviceID -> remembered device
 }
 
-// legacyConfig holds the Portuguese keys of earlier versions; they are migrated on load.
+// legacyConfig holds the keys of earlier versions (Portuguese, then slot bindings); they are
+// migrated on load.
 type legacyConfig struct {
 	Nome       string   `json:"nome"`
 	Slots      int      `json:"slots"`
@@ -78,6 +85,10 @@ type legacyConfig struct {
 		DeviceID string `json:"deviceID"`
 		Iphone   string `json:"iphone"`
 	} `json:"vinculos"`
+	Bindings map[string]struct {
+		DeviceID string `json:"deviceID"`
+		Device   string `json:"device"`
+	} `json:"bindings"`
 }
 
 // The receiver must declare a display size in AirPlay; the sender scales its screen to fit it.
@@ -136,6 +147,7 @@ var (
 	configNotice string // broken config warning at startup (shown once the tray exists)
 	lastIcon     string
 	lastTooltip  string
+	lastStatus   string
 	currentFree  int               // slot currently serving as the free one (0 = none); computed in adjustSlots
 	configBroken bool              // config.json on disk is broken: don't overwrite it until the user fixes it
 	readFailed   bool              // the last read of config.json failed: don't save over the user's edits until one works
@@ -145,82 +157,88 @@ var (
 	crashWarned  bool              // crash loop popup already shown; reset on Restart or a settings change
 )
 
-// Slot is a UxPlay of its own (name, ports, MAC and window "Slot N" in OBS). The first device that
-// connects to a free slot is bound to it: the slot then only accepts that device (-restrict -allow)
-// and the other slots refuse it (-block). So device X always comes back to slot X.
+// Slot is one UxPlay instance of the pool, with its own ports and MAC (the name is the same for
+// all). It is either the free one (advertised, waiting for the next device), busy with a device's
+// session (hidden from Screen Mirroring by the patched UxPlay), or down.
 type Slot struct {
 	N         int
-	active    bool // should be running (bound, or the current free one)
+	active    bool // should be running (busy, or the current free one)
 	running   bool // a supervisor goroutine owns this slot
 	cmd       *exec.Cmd
 	args      []string  // args the current UxPlay started with (nil without a process)
+	argsRes   string    // resolution and fps the current UxPlay started with
+	argsFPS   int       //
 	started   time.Time // when the current UxPlay started
 	failed    time.Time // last start error; retried 10 s later
 	restartCh chan struct{}
 	state     string
 	color     string
 
-	newSock    string // socket of the last connection accepted by UxPlay's httpd
-	candName   string // device that asked to connect and was not yet accepted or refused
-	candID     string
-	candSock   string
-	sock       string    // socket of the accepted session
-	device     string    // last accepted device
-	connected  time.Time // when it was accepted
-	mirroring  bool      // UxPlay is receiving video (from the log)
-	videoStart time.Time // when video started
-	ended      time.Time // when the last mirroring session ended
-	width      int       // source video size from the last geometry line
-	height     int
-	codec      string    // "H.264" or "H.265", from the last geometry line
-	geometryAt time.Time // when the geometry last changed
-	pending    bool      // restart when idle even without arg changes (network changed)
-	// With -nohold, a reconnecting device takes over the session still running; UxPlay may log the
-	// end of the old session after the new one's "Begin streaming". takeover marks the switch and
-	// endings without a socket that arrive before ignoreEndsUntil belong to the old session. The old
-	// socket may also close first: sockEnded is when a session last ended by its socket, whose mirror
-	// thread may still log its end after the next session starts.
-	takeover        bool
-	ignoreEndsUntil time.Time
-	sockEnded       time.Time
-	unbound         string // deviceID unbound while UxPlay was still running; not rebound until restart
-	crashStopped    bool   // stopped after 3 quick crashes; waits for Restart or a settings change
+	newSock      string // socket of the last connection accepted by UxPlay's httpd
+	candName     string // device that asked to connect and was not yet accepted or refused
+	candID       string
+	candSock     string
+	candAt       time.Time // when that device asked to connect
+	sock         string    // socket of the accepted session
+	device       string    // name the accepted device sent
+	deviceID     string    // deviceID of the accepted device; empty while nobody connected since the start
+	title        string    // window title of the session (the device's display name, unique)
+	connected    time.Time // when it was accepted
+	mirroring    bool      // UxPlay is receiving video (from the log)
+	videoStart   time.Time // when video started
+	ended        time.Time // when the last mirroring session ended
+	width        int       // source video size from the last geometry line
+	height       int
+	codec        string    // "H.264" or "H.265", from the last geometry line
+	geometryAt   time.Time // when the geometry last changed
+	fps          float64   // frame rate the client reports (-FPSdata); 0 = unknown
+	plist        []string  // lines of the FPS report being read
+	plistShown   bool      // the first FPS report of the session was written to the log
+	dropBlank    bool      // skip the empty line UxPlay prints after a report left out of the log
+	hidden       bool      // the patched UxPlay removed its advertisement (a device mirrors, or announcing again failed)
+	announced    time.Time // when its UxPlay last announced itself over mDNS, from the log (see poolPlan)
+	readvertised bool      // the session ended and UxPlay announced itself again: free, the last device kept for its window
+	ready        bool      // the current UxPlay announced itself ("mDNS: advertised at startup")
+	pending      bool      // restart when idle even without arg changes (network changed)
+	crashStopped bool      // stopped after 3 quick crashes; waits for Restart or a settings change
+	crashedOut   bool      // crash-stopped once: not used for the pool until Restart or a settings change
 
 	// fitted is the video size each of the slot's windows was last fitted to, so a window is fitted
 	// when it shows up and on each new geometry, not in between. Guarded by fitMu.
 	fitted map[windows.HWND][2]int
 
-	title  string // last text set on the menu item (empty = forces SetTitle when shown)
+	line   string // last text set on the menu item (empty = forces SetTitle when shown)
 	item   *systray.MenuItem
-	unbind *systray.MenuItem
+	apply  *systray.MenuItem // "Apply now": shown while new settings wait for this instance's restart
+	forget *systray.MenuItem // "Forget device"
 }
 
 func defaultConfig() Config {
-	return Config{Name: "LIVE", MaxSlots: slotLimit, Resolution: "native", FPS: 60, ExtraArgs: []string{}, Bindings: map[string]Binding{}}
+	return Config{Name: "LIVE", MaxSlots: slotLimit, Resolution: "native", FPS: 60, ExtraArgs: []string{}, Devices: map[string]Device{}}
 }
-
-func (s *Slot) key() string { return strconv.Itoa(s.N) }
-
-// name is what shows in Screen Mirroring; with maxSlots 1 it is just "LIVE". Call with mu held.
-func (s *Slot) name() string {
-	if cfg.MaxSlots == 1 {
-		return cfg.Name
-	}
-	return fmt.Sprintf("%s %d", cfg.Name, s.N)
-}
-
-func (s *Slot) window() string { return fmt.Sprintf("Slot %d", s.N) }
 
 // idleAt tells whether the slot can be restarted or stopped without dropping anyone: nobody
-// mirroring (from UxPlay's log), no device accepted in the last 20 s (video only starts after)
-// and 5 s since the last session ended. Call with mu held.
+// mirroring (from UxPlay's log), no device asking to connect in the last 10 s (the handshake), no
+// device accepted in the last 20 s (video only starts after) unless its session already ended and
+// UxPlay advertised again, and 5 s since the last session ended. Call with mu held.
 func (s *Slot) idleAt(now time.Time) bool {
-	return s.cmd == nil || (!s.mirroring && now.Sub(s.connected) > 20*time.Second && now.Sub(s.ended) > 5*time.Second)
+	if s.cmd == nil {
+		return true
+	}
+	handshake := s.candID != "" && now.Sub(s.candAt) <= 10*time.Second
+	accepted := !s.readvertised && now.Sub(s.connected) <= 20*time.Second
+	return !s.mirroring && !handshake && !accepted && now.Sub(s.ended) > 5*time.Second
 }
 
 // busyAt tells whether the slot is up with a session in progress (mirroring or in the grace
-// period). Such a slot can't be the free one: UxPlay refuses a second device. Call with mu held.
+// period). Such a slot can't be the free one. Call with mu held.
 func (s *Slot) busyAt(now time.Time) bool { return s.active && !s.idleAt(now) }
+
+// used tells whether the slot holds a device's session: a device connected to its UxPlay since it
+// started and the patched UxPlay did not advertise it again after the mirroring. Its window
+// (frozen on the last frame) and state belong to that session, so it restarts before serving
+// another device. Once advertised again, UxPlay serves the next device as it is. Call with mu held.
+func (s *Slot) used() bool { return s.cmd != nil && s.deviceID != "" && !s.readvertised }
 
 // orientation describes the source video, e.g. "portrait 1320×2868"; empty if unknown.
 func orientation(w, h int) string {
@@ -247,6 +265,124 @@ func parseGeometry(line string) (codec string, w, h int, ok bool) {
 	return "H." + m[1][1:], w, h, true
 }
 
+// rePlistToken reads the parts of a plist in XML (libplist's plist_to_xml, as UxPlay prints the
+// client's reports with -FPSdata) that matter here: keys, scalar values and dict/array bounds.
+var rePlistToken = regexp.MustCompile(`<(key|string|integer|real)>([^<]*)</(?:key|string|integer|real)>|<(/?)(dict|array)>|<(dict|array)/>`)
+
+// plistNode is a value of a parsed plist: a dict (keys and vals in order), an array (vals) or a scalar.
+type plistNode struct {
+	kind string // "dict", "array", "string", "integer", "real"
+	text string
+	keys []string
+	vals []*plistNode
+}
+
+// parsePlistXML reads a plist in XML loosely: it never fails, a cut or interleaved line just loses
+// the values around it.
+func parsePlistXML(xml string) *plistNode {
+	root := &plistNode{kind: "array"}
+	stack := []*plistNode{root}
+	pendingKey := ""
+	add := func(n *plistNode) {
+		top := stack[len(stack)-1]
+		if top.kind == "dict" {
+			top.keys = append(top.keys, pendingKey)
+		}
+		top.vals = append(top.vals, n)
+		pendingKey = ""
+	}
+	for _, m := range rePlistToken.FindAllStringSubmatch(xml, -1) {
+		switch {
+		case m[1] == "key":
+			pendingKey = strings.TrimSpace(m[2])
+		case m[1] != "":
+			add(&plistNode{kind: m[1], text: strings.TrimSpace(m[2])})
+		case m[5] != "": // <dict/>, <array/>
+			add(&plistNode{kind: m[5]})
+		case m[3] == "": // opening
+			n := &plistNode{kind: m[4]}
+			add(n)
+			stack = append(stack, n)
+		case len(stack) > 1 && stack[len(stack)-1].kind == m[4]: // matching close
+			stack = stack[:len(stack)-1]
+			pendingKey = ""
+		}
+	}
+	return root
+}
+
+func (n *plistNode) number() (float64, bool) {
+	if n == nil || (n.kind != "integer" && n.kind != "real") {
+		return 0, false
+	}
+	v, err := strconv.ParseFloat(n.text, 64)
+	return v, err == nil
+}
+
+// parseFPSReport reads the frame rate from one of the client's -FPSdata reports (a plist, about
+// once a second). UxPlay prints it as the client sends it and its keys are the client's, so they are
+// matched loosely: a number labeled by its key or by the "name" of its dict, preferring the frame
+// rate the client sent ("Sent" in its fpsInfo stages), then any label with "fps" or "frame rate".
+func parseFPSReport(xml string) (float64, bool) {
+	best, bestScore := 0.0, 0
+	consider := func(label string, path []string, v float64) {
+		if v < 0 || v > 1000 {
+			return
+		}
+		l := strings.ToLower(strings.TrimSpace(label))
+		inFPS := false
+		for _, p := range path {
+			inFPS = inFPS || strings.Contains(strings.ToLower(p), "fps")
+		}
+		score := 0
+		switch {
+		case inFPS && (l == "sent" || l == "sndfr"):
+			score = 5
+		case l == "fps" || strings.HasSuffix(l, "fps") && strings.Contains(l, "sent"):
+			score = 4
+		case strings.Contains(l, "fps") && !strings.Contains(l, "max"):
+			score = 3
+		case strings.Contains(l, "framerate") || strings.Contains(l, "frame rate"):
+			score = 2
+		}
+		if score > bestScore {
+			best, bestScore = v, score
+		}
+	}
+	var walk func(n *plistNode, path []string)
+	walk = func(n *plistNode, path []string) {
+		if n.kind == "dict" {
+			// A {name: "Sent", value: 59.9}-style entry: the number is labeled by the name.
+			name, nums := "", []int{}
+			for i, k := range n.keys {
+				switch {
+				case strings.EqualFold(k, "name") && n.vals[i].kind == "string":
+					name = n.vals[i].text
+				case n.vals[i].kind == "integer" || n.vals[i].kind == "real":
+					nums = append(nums, i)
+				}
+			}
+			for _, i := range nums {
+				v, _ := n.vals[i].number()
+				k := strings.ToLower(n.keys[i])
+				if name != "" && (len(nums) == 1 || k == "value" || k == "fps" || k == "val") {
+					consider(name, path, v)
+				}
+				consider(n.keys[i], path, v)
+			}
+		}
+		for i, c := range n.vals {
+			p := path
+			if n.kind == "dict" && i < len(n.keys) {
+				p = append(slices.Clone(path), n.keys[i])
+			}
+			walk(c, p)
+		}
+	}
+	walk(parsePlistXML(xml), nil)
+	return best, bestScore > 0
+}
+
 func main() {
 	// Two running copies would fight over the same names and ports and crash in a loop.
 	if !singleInstance() {
@@ -267,9 +403,9 @@ func main() {
 }
 
 // startupConfigNotice handles a config.json that could not be loaded at startup: it keeps a copy of
-// a broken file (so the bindings are not lost), logs, and returns the popup text.
+// a broken file (so the remembered devices are not lost), logs, and returns the popup text.
 func startupConfigNotice(err error) string {
-	const after = "\n\nThe app started with the defaults, without bindings, and will not overwrite the file. "
+	const after = "\n\nThe app started with the defaults, without the remembered devices, and will not overwrite the file. "
 	var re *readError
 	if errors.As(err, &re) {
 		logf("config.json could not be read: %v; using defaults in memory only", err)
@@ -357,10 +493,13 @@ func logf(f string, a ...any) {
 	fmt.Fprintf(logFile, "%s  %s\n", time.Now().Format("2006-01-02 15:04:05"), fmt.Sprintf(f, a...))
 }
 
-const migratedNote = "config: old keys migrated to English; original kept in config.json.v1"
+const (
+	migratedNote = "config: old keys migrated to English; original kept in config.json.v1"
+	bindingsNote = "config: slot bindings converted to devices; original kept in config.json.v2"
+)
 
 // parseConfig decodes config.json over the defaults, migrates the old Portuguese keys and
-// normalizes. It also returns what is worth logging (migration, ignored bindings).
+// normalizes. It also returns what is worth logging (migrations).
 func parseConfig(b []byte) (Config, []string, error) {
 	n := defaultConfig()
 	n.MaxSlots = 0                                  // to know whether the file has the field
@@ -394,10 +533,30 @@ func parseConfig(b []byte) (Config, []string, error) {
 	if !has("extraArgs") && has("argsExtras") {
 		n.ExtraArgs, migrated = old.ArgsExtras, true
 	}
-	if !has("bindings") && has("vinculos") {
-		n.Bindings, migrated = map[string]Binding{}, true
-		for k, v := range old.Vinculos {
-			n.Bindings[k] = Binding{DeviceID: v.DeviceID, Device: v.Iphone}
+	if !has("devices") {
+		// Slot bindings of earlier versions: the bound devices are remembered, so their window keeps
+		// following them (named after the device now).
+		type bound struct{ id, name string }
+		var bs []bound
+		for _, v := range old.Bindings {
+			bs = append(bs, bound{v.DeviceID, v.Device})
+		}
+		if !has("bindings") {
+			for _, v := range old.Vinculos {
+				bs = append(bs, bound{v.DeviceID, v.Iphone})
+			}
+		}
+		for _, b := range bs {
+			if id := strings.TrimSpace(b.id); id != "" {
+				n.Devices[id] = Device{Name: b.name}
+			}
+		}
+		switch {
+		case has("bindings"):
+			notes = append(notes, fmt.Sprintf("%s: %d device(s) remembered", bindingsNote, len(n.Devices)))
+		case has("vinculos"):
+			migrated = true
+			notes = append(notes, fmt.Sprintf("config: \"vinculos\" converted to devices: %d device(s) remembered", len(n.Devices)))
 		}
 	}
 	if _, ok := resolutions[n.Resolution]; !ok {
@@ -410,8 +569,8 @@ func parseConfig(b []byte) (Config, []string, error) {
 		n.Name = "LIVE"
 	}
 	if n.MaxSlots == 0 {
-		// Old config: "slots": 1 was single mode (one LIVE, no binding); 2+ were fixed slots, which
-		// are now dynamic (only bound slots plus one free run), so it goes to the limit.
+		// Old config: "slots" was the number of fixed slots; the pool now grows on demand, so it
+		// goes to the limit (a single slot stays a single device).
 		n.MaxSlots = slotLimit
 		if old.Slots == 1 {
 			n.MaxSlots = 1
@@ -428,15 +587,10 @@ func parseConfig(b []byte) (Config, []string, error) {
 	if n.ExtraArgs == nil {
 		n.ExtraArgs = []string{}
 	}
-	if n.Bindings == nil {
-		n.Bindings = map[string]Binding{}
+	if n.Devices == nil {
+		n.Devices = map[string]Device{}
 	}
-	for _, k := range sortedKeys(n.Bindings) {
-		if num, err := strconv.Atoi(k); err != nil || num < 1 || num > n.MaxSlots || n.MaxSlots == 1 {
-			notes = append(notes, fmt.Sprintf("config: binding of slot %s, %s, ignored: outside maxSlots %d",
-				k, n.Bindings[k].Device, n.MaxSlots))
-		}
-	}
+	delete(n.Devices, "")
 	return n, notes, nil
 }
 
@@ -500,7 +654,7 @@ func loadConfigLocked() error {
 		if bak, err := os.ReadFile(configPath + ".bak"); err == nil {
 			if r, ok := fromBackup(n, bak); ok {
 				n = r
-				notes = append(notes, "config: config.json was rewritten by an older version; settings and bindings restored from config.json.bak")
+				notes = append(notes, "config: config.json was rewritten by an older version; settings and devices restored from config.json.bak")
 			}
 		}
 		// Older versions only read the old keys: keep the original for a downgrade.
@@ -508,9 +662,14 @@ func loadConfigLocked() error {
 			os.WriteFile(configPath+".v1", b, 0o644)
 		}
 	}
+	if slices.ContainsFunc(notes, func(t string) bool { return strings.HasPrefix(t, bindingsNote) }) {
+		if _, err := os.Stat(configPath + ".v2"); errors.Is(err, fs.ErrNotExist) {
+			os.WriteFile(configPath+".v2", b, 0o644)
+		}
+	}
 	mu.Lock()
 	onDisk := n
-	onDisk.Bindings = maps.Clone(n.Bindings)
+	onDisk.Devices = maps.Clone(n.Devices)
 	notes = append(notes, mergeMemory(&n, cfg, diskCfg)...)
 	cfg, configBroken, readFailed, diskCfg = n, false, false, onDisk
 	saveConfig()
@@ -523,22 +682,22 @@ func loadConfigLocked() error {
 }
 
 // fromBackup handles a config.json rewritten by an older version started by mistake: it read none
-// of the English keys, so the settings come from config.json.bak, and the bindings it made are
-// merged with the backup's (the file wins on a slot or device conflict).
+// of the English keys, so the settings come from config.json.bak, and the devices it remembered are
+// merged with the backup's (the file wins on a conflict).
 func fromBackup(n Config, bak []byte) (Config, bool) {
 	r, _, err := parseConfig(bak)
 	if err != nil {
 		return n, false
 	}
-	merged := maps.Clone(n.Bindings)
-	mergeBindings(merged, r.Bindings, nil)
-	r.Bindings = merged
+	merged := maps.Clone(n.Devices)
+	mergeDevices(merged, r.Devices, nil)
+	r.Devices = merged
 	return r, true
 }
 
 // mergeMemory applies to n (just read from config.json) the changes made in the app since the
-// disk last had base, which never reached the disk: Resolution, FPS, bindings and unbinds. What the
-// file changed itself wins. Returns lines for the log. Call with mu held.
+// disk last had base, which never reached the disk: Resolution, FPS, devices remembered and
+// forgotten. What the file changed itself wins. Returns lines for the log. Call with mu held.
 func mergeMemory(n *Config, mem, base Config) []string {
 	var notes []string
 	if mem.Resolution != base.Resolution && n.Resolution == base.Resolution {
@@ -549,20 +708,20 @@ func mergeMemory(n *Config, mem, base Config) []string {
 		n.FPS = mem.FPS
 		notes = append(notes, fmt.Sprintf("config: fps %d chosen in the tray kept: it was not saved yet", mem.FPS))
 	}
-	kept, unbound := mergeBindings(n.Bindings, mem.Bindings, base.Bindings)
+	kept, forgotten := mergeDevices(n.Devices, mem.Devices, base.Devices)
 	for _, k := range kept {
-		notes = append(notes, fmt.Sprintf("config: binding of slot %s, %s, kept: it was not saved yet", k, n.Bindings[k].Device))
+		notes = append(notes, fmt.Sprintf("config: device %s, %s, kept: it was not saved yet", n.Devices[k].Name, k))
 	}
-	for _, k := range unbound {
-		notes = append(notes, fmt.Sprintf("config: slot %s kept unbound: the unbind was not saved yet", k))
+	for _, k := range forgotten {
+		notes = append(notes, fmt.Sprintf("config: device %s kept forgotten: it was not saved yet", k))
 	}
 	return notes
 }
 
-// mergeBindings applies to file the binding changes in mem since base (bindings added or replaced,
-// unbinds). A slot the file changed itself is left to the file, and so is a device the file binds
-// to another slot. Returns the slots taken from mem and the slots unbound.
-func mergeBindings(file, mem, base map[string]Binding) (kept, unbound []string) {
+// mergeDevices applies to file the device changes in mem since base (devices remembered or
+// updated, devices forgotten). A device the file changed itself is left to the file. Returns the
+// deviceIDs taken from mem and the ones forgotten.
+func mergeDevices(file, mem, base map[string]Device) (kept, forgotten []string) {
 	orig := maps.Clone(file)
 	untouched := func(k string) bool { // the file still has what the disk had
 		a, inFile := orig[k]
@@ -570,28 +729,19 @@ func mergeBindings(file, mem, base map[string]Binding) (kept, unbound []string) 
 		return inFile == inBase && a == b
 	}
 	for _, k := range sortedKeys(base) {
-		if m, ok := mem[k]; (!ok || m != base[k]) && untouched(k) {
+		if _, ok := mem[k]; !ok && untouched(k) {
 			delete(file, k)
-			if !ok {
-				unbound = append(unbound, k)
-			}
+			forgotten = append(forgotten, k)
 		}
 	}
 	for _, k := range sortedKeys(mem) {
-		b := mem[k]
-		if x, ok := base[k]; (ok && x == b) || !untouched(k) {
+		if x, ok := base[k]; (ok && x == mem[k]) || !untouched(k) {
 			continue
 		}
-		taken := false
-		for _, x := range file {
-			taken = taken || x.DeviceID == b.DeviceID
-		}
-		if !taken {
-			file[k] = b
-			kept = append(kept, k)
-		}
+		file[k] = mem[k]
+		kept = append(kept, k)
 	}
-	return kept, unbound
+	return kept, forgotten
 }
 
 // reloadConfig rereads a hand-edited config.json and says whether it worked. Changes apply to each
@@ -624,7 +774,6 @@ func reloadConfig() bool {
 func afterReload() {
 	syncChecks()
 	adjustSlots()
-	updateStatus()
 	for _, s := range slots {
 		updateMenu(s)
 	}
@@ -642,7 +791,7 @@ func saveConfig() {
 }
 
 // writeConfig writes the config if memory has changes the disk doesn't. While the user's file is
-// broken or unreadable it doesn't write: they would lose what they typed (and the bindings). If the
+// broken or unreadable it doesn't write: they would lose what they typed (and the devices). If the
 // file changed on disk since the app last read or wrote it (edited by hand), it is read and merged
 // first instead of being overwritten. It also keeps config.json.bak, which an older version started
 // by mistake won't touch. Call without mu held.
@@ -669,7 +818,7 @@ func writeConfigLocked(mergeEdits bool) error {
 	mu.Lock()
 	b, _ := json.MarshalIndent(cfg, "", "  ")
 	gen, snap := saveGen, cfg
-	snap.Bindings = maps.Clone(cfg.Bindings)
+	snap.Devices = maps.Clone(cfg.Devices)
 	mu.Unlock()
 
 	err := writeFileAtomic(configPath, b)
@@ -730,7 +879,7 @@ func keepConfig() {
 			}
 			if lastErr != "" && !warned { // failed twice in a row: not a passing lock
 				warned = true
-				go warn("config.json can't be saved:\n" + err.Error() + "\n\nBindings and settings are kept in memory " +
+				go warn("config.json can't be saved:\n" + err.Error() + "\n\nDevices and settings are kept in memory " +
 					"and saved as soon as it works. If the file is read-only, clear that in its Properties.")
 			}
 			lastErr = err.Error()
@@ -768,7 +917,7 @@ func writeFileAtomic(path string, b []byte) error {
 	return err
 }
 
-func sortedKeys(v map[string]Binding) []string {
+func sortedKeys[V any](v map[string]V) []string {
 	ks := make([]string, 0, len(v))
 	for k := range v {
 		ks = append(ks, k)
@@ -777,19 +926,59 @@ func sortedKeys(v map[string]Binding) []string {
 	return ks
 }
 
-// validBindings are the bindings that apply with the current maxSlots (none with 1 slot).
-// Call with mu held.
-func validBindings() map[string]Binding {
-	v := map[string]Binding{}
-	if cfg.MaxSlots == 1 {
-		return v
+// displayName is the name a device goes by: its label if set, else the name it sends (or sent last
+// time). Call with mu held.
+func displayName(id, sent string) string {
+	d := cfg.Devices[id]
+	switch {
+	case strings.TrimSpace(d.Label) != "":
+		return strings.TrimSpace(d.Label)
+	case strings.TrimSpace(sent) != "":
+		return strings.TrimSpace(sent)
+	case strings.TrimSpace(d.Name) != "":
+		return strings.TrimSpace(d.Name)
 	}
-	for k, x := range cfg.Bindings {
-		if n, err := strconv.Atoi(k); err == nil && n >= 1 && n <= cfg.MaxSlots {
-			v[k] = x
+	return id
+}
+
+// hasBase tells whether the title t is base or base followed by " N" (N >= 2).
+func hasBase(t, base string) bool {
+	if t == base {
+		return true
+	}
+	rest, ok := strings.CutPrefix(t, base+" ")
+	n, err := strconv.Atoi(rest)
+	return ok && err == nil && n >= 2 && strconv.Itoa(n) == rest
+}
+
+// pickTitle gives the window title of device id, whose display name is base. It is unique among the
+// open sessions (open: title -> deviceID) and the titles remembered for other devices, and the same
+// as last time whenever it can be, so the OBS source keeps following the device across reconnects
+// and app restarts. Two devices with the same name get "name" and "name 2".
+func pickTitle(id, base string, devices map[string]Device, open map[string]string) string {
+	taken := func(t string) bool {
+		if o, ok := open[t]; ok && o != id {
+			return true
+		}
+		for k, d := range devices {
+			if k != id && d.Window == t {
+				return true
+			}
+		}
+		return false
+	}
+	if w := devices[id].Window; w != "" && hasBase(w, base) && !taken(w) {
+		return w
+	}
+	for n := 1; ; n++ {
+		t := base
+		if n > 1 {
+			t = fmt.Sprintf("%s %d", base, n)
+		}
+		if !taken(t) {
+			return t
 		}
 	}
-	return v
 }
 
 func onReady() {
@@ -799,11 +988,14 @@ func onReady() {
 	mStatus = systray.AddMenuItem("Preparing…", "")
 	mStatus.Disable()
 	systray.AddSeparator()
-	// The menu can't insert items in the middle later: create every slot now and show the active ones.
+	// The menu can't insert items in the middle later: create every instance now and show the active ones.
 	for n := 1; n <= slotLimit; n++ {
 		s := &Slot{N: n, restartCh: make(chan struct{}, 1), state: "starting", color: "gray"}
 		s.item = systray.AddMenuItem("", "")
-		s.unbind = s.item.AddSubMenuItem("Unbind this slot", "")
+		s.apply = s.item.AddSubMenuItem("Apply now", "")
+		s.forget = s.item.AddSubMenuItem("Forget device", "")
+		s.apply.Hide()
+		s.forget.Hide()
 		s.item.Hide()
 		slots = append(slots, s)
 	}
@@ -850,7 +1042,7 @@ func onReady() {
 		for {
 			select {
 			case <-mRestart.ClickedCh:
-				if reloadConfig() { // a config that didn't load changes nothing: keep live slots
+				if reloadConfig() { // a config that didn't load changes nothing: keep live sessions
 					restartAll()
 				}
 			case <-mLog.ClickedCh:
@@ -864,8 +1056,13 @@ func onReady() {
 	}()
 	for _, s := range slots {
 		go func(s *Slot) {
-			for range s.unbind.ClickedCh {
-				unbindSlot(s)
+			for {
+				select {
+				case <-s.apply.ClickedCh:
+					applyNow(s)
+				case <-s.forget.ClickedCh:
+					forgetDevice(s)
+				}
 			}
 		}(s)
 	}
@@ -885,7 +1082,6 @@ func onReady() {
 	mu.Lock()
 	uxplayExe = exe
 	mu.Unlock()
-	updateStatus()
 	adjustSlots()
 	go watchNetwork()
 	go watchNewWindows()
@@ -925,54 +1121,78 @@ func openInNotepad(path string) {
 	}
 }
 
-// slotTitle is the menu line of a slot, e.g. "LIVE 2 · Otavio's iPhone · live · H.265 · portrait 1320×2868".
-// Call with mu held.
-func slotTitle(s *Slot) (string, bool) {
-	b, bound := validBindings()[s.key()]
-	who := b.Device
-	if !bound {
-		switch {
-		case s.mirroring || s.state == "connecting":
-			who = s.device
-		case cfg.MaxSlots == 1:
-			who = "any device"
-		default:
-			who = "free"
-		}
+// pendingNote says what a session will get on reconnect when the settings changed since its
+// UxPlay started, e.g. "SD on reconnect"; empty if nothing is waiting. Call with mu held.
+func pendingNote(s *Slot) string {
+	if s.cmd == nil || s.args == nil || slices.Equal(slotArgs(s), s.args) {
+		return ""
 	}
-	t := fmt.Sprintf("%s · %s · %s", s.name(), who, s.state)
-	if o := orientation(s.width, s.height); o != "" && s.mirroring {
+	var parts []string
+	if cfg.Resolution != s.argsRes {
+		parts = append(parts, resolutionLabels[cfg.Resolution])
+	}
+	if cfg.FPS != s.argsFPS {
+		parts = append(parts, fmt.Sprintf("%d fps", cfg.FPS))
+	}
+	if parts == nil {
+		parts = []string{"new settings"}
+	}
+	return strings.Join(parts, " ") + " on reconnect"
+}
+
+// slotLine is the menu line of an instance, e.g.
+// "Otavio Augusto’s iPhone · live · H.265 · portrait 1325×2880 · 60 fps", or "LIVE · waiting" for the
+// free one. Call with mu held.
+func slotLine(s *Slot) string {
+	if s.deviceID == "" || s.readvertised { // nobody since the start, or free again after a session
+		return cfg.Name + " · " + s.state
+	}
+	who := s.title
+	if who == "" {
+		who = displayName(s.deviceID, s.device)
+	}
+	t := who + " · " + s.state
+	if s.mirroring {
 		if s.codec != "" {
 			t += " · " + s.codec
 		}
-		t += " · " + o
+		if o := orientation(s.width, s.height); o != "" {
+			t += " · " + o
+		}
+		if s.fps > 0 {
+			t += fmt.Sprintf(" · %.0f fps", s.fps)
+		}
 	}
-	return t, bound
+	if p := pendingNote(s); p != "" {
+		t += " · " + p
+	}
+	return t
 }
 
-// updateMenu rewrites the slot's line, the icon and the tray tooltip (only when they change).
+// updateMenu rewrites the instance's line, its submenu, the status line, the icon and the tray
+// tooltip (only when they change).
 func updateMenu(s *Slot) {
 	mu.Lock()
 	defer mu.Unlock()
-	t, bound := slotTitle(s)
-	// Slot not running: the item is hidden and any SetTitle/SetTooltip/Enable/Disable from systray
-	// shows it again. When it comes up, adjustSlots calls this again with s.title empty.
-	if k := fmt.Sprint(t, bound); s.active && k != s.title {
-		s.title = k
+	if mStatus == nil || s.item == nil {
+		return // the tray is not up yet
+	}
+	t := slotLine(s)
+	_, known := cfg.Devices[s.deviceID]
+	dev := s.deviceID != "" && !s.readvertised // the line is the device's
+	apply, forget := dev && pendingNote(s) != "", dev && known
+	// Instance not running: the item is hidden and any SetTitle/Show from systray shows it again.
+	// When it comes up, adjustSlots calls this again with s.line empty.
+	if k := fmt.Sprint(t, apply, forget); s.active && k != s.line {
+		s.line = k
 		s.item.SetTitle(t)
-		if bound {
-			s.unbind.Enable()
-		} else {
-			s.unbind.Disable()
-		}
+		showItem(s.apply, apply)
+		showItem(s.forget, forget)
 	}
 
-	// Icon: red if any slot has an error; else green if any is live; else yellow if any needs
+	// Icon: red if any instance has an error; else green if any is live; else yellow if any needs
 	// attention (connecting, reconnecting, stopped); else blue (ready, waiting).
-	failed, live, attention, someActive, free := false, 0, false, false, ""
-	if currentFree > 0 {
-		free = slots[currentFree-1].name()
-	}
+	failed, live, attention, someActive, free := false, 0, false, false, false
 	for _, o := range slots {
 		if !o.active {
 			continue
@@ -987,6 +1207,7 @@ func updateMenu(s *Slot) {
 		if o.mirroring {
 			live++
 		}
+		free = free || o.N == currentFree
 	}
 	c := "gray"
 	switch {
@@ -999,12 +1220,11 @@ func updateMenu(s *Slot) {
 	case someActive:
 		c = "blue"
 	}
-	tip := fmt.Sprintf("%s: %d live · free: %s", appTitle, live, free)
-	switch {
-	case cfg.MaxSlots == 1:
-		tip = fmt.Sprintf("%s: %d live", appTitle, live)
-	case free == "":
-		tip = fmt.Sprintf("%s: %d live · all slots bound", appTitle, live)
+	tip := fmt.Sprintf("%s: %d live", appTitle, live)
+	status := fmt.Sprintf("%d live · up to %d", live, cfg.MaxSlots)
+	if !free && someActive {
+		tip += " · no free " + cfg.Name
+		status = fmt.Sprintf("%d live · full: maxSlots is %d", live, cfg.MaxSlots)
 	}
 	if c != lastIcon {
 		lastIcon = c
@@ -1013,6 +1233,18 @@ func updateMenu(s *Slot) {
 	if tip != lastTooltip {
 		lastTooltip = tip
 		systray.SetTooltip(tip)
+	}
+	if status != lastStatus && uxplayExe != "" {
+		lastStatus = status
+		mStatus.SetTitle(status)
+	}
+}
+
+func showItem(it *systray.MenuItem, show bool) {
+	if show {
+		it.Show()
+	} else {
+		it.Hide()
 	}
 }
 
@@ -1023,55 +1255,85 @@ func setState(s *Slot, state, c string) {
 	updateMenu(s)
 }
 
-func updateStatus() {
-	mu.Lock()
-	n := len(validBindings())
-	var t string
-	switch {
-	case cfg.MaxSlots == 1:
-		t = "Single LIVE · any device"
-	case n >= cfg.MaxSlots:
-		t = fmt.Sprintf("All %d slots bound: unbind one to free a slot", cfg.MaxSlots)
-	default:
-		t = fmt.Sprintf("%d of %d slots bound", n, cfg.MaxSlots)
-	}
-	mu.Unlock()
-	mStatus.SetTitle(t)
+// slotView is what poolPlan needs to know about an instance.
+type slotView struct {
+	active    bool      // should be running
+	running   bool      // a supervisor still owns it (it may be going down)
+	busy      bool      // a session in progress
+	used      bool      // a device connected since its UxPlay started
+	ready     bool      // its current UxPlay is up and advertised
+	broken    bool      // stopped by a crash loop: another instance number is used instead
+	hidden    bool      // its UxPlay withdrew its advertisement (a session, even if over)
+	announced time.Time // when its UxPlay last announced itself over mDNS (at startup or again), from the log
 }
 
-// wantedSlots says which slots should run: one per bound device plus a free one for the next
-// device, up to max. It also returns the free one (0 if none). An unbound slot with a session in
-// progress (busy; e.g. unbound while the device is still mirroring) can't be the free one: UxPlay
-// would refuse the new device. The current free slot stays free while it qualifies, so nobody
-// connecting to it is dropped (e.g. after unbinding a lower-numbered slot, which only goes down).
-func wantedSlots(max int, v map[string]Binding, busy map[int]bool, current int) (map[int]bool, int) {
-	want, free := map[int]bool{}, 0
-	qualifies := func(n int) bool {
-		_, bound := v[strconv.Itoa(n)]
-		return n >= 1 && n <= max && n <= slotLimit && (!bound || max == 1) && !busy[n]
-	}
-	for n := 1; n <= max && n <= slotLimit; n++ {
-		if _, ok := v[strconv.Itoa(n)]; ok && max > 1 {
-			want[n] = true
+// poolPlan says which instances should run: every busy one plus one free one for the next device,
+// at most max in all. free is that one (0 when the pool is full) and restart tells whether it must
+// restart first (a used instance whose session is over: its window holds the last frame). v[n-1] is
+// instance n.
+//
+// All instances share the service name, so the devices' mDNS caches keep the address of the
+// instance that announced itself last (its records flush the others'), and an instance stopped by
+// the app sends no goodbye. The patched UxPlay announces at startup and again when a mirroring
+// session ends, so an instance whose session just ended takes LIVE over from the free one in the
+// devices' caches (if announcing again failed it stays hidden and restarts when it is needed). So
+// the free one is the idle instance that is not hidden and announced last, and the other idle one
+// goes down; the current free one wins a tie. A new instance is started only when no running one is idle. While
+// the free one is restarting or not yet advertised, the other idle ones that are not hidden stay
+// up: they still answer devices that query LIVE again, and one of them takes over if the free one
+// fails.
+func poolPlan(max int, v []slotView, current int) (want map[int]bool, free int, restart bool) {
+	want = map[int]bool{}
+	busy := 0
+	for i, x := range v {
+		if x.active && x.busy {
+			want[i+1] = true
+			busy++
 		}
 	}
-	if qualifies(current) {
+	if busy >= max {
+		return want, 0, false
+	}
+	idle := func(n int) bool { return n >= 1 && n <= len(v) && v[n-1].active && !v[n-1].busy && !v[n-1].broken }
+	if idle(current) {
 		free = current
-	} else {
-		for n := 1; n <= max && n <= slotLimit && free == 0; n++ {
-			if qualifies(n) {
-				free = n
-			}
+	}
+	for n := 1; n <= len(v); n++ {
+		if !idle(n) {
+			continue
+		}
+		if free == 0 {
+			free = n
+			continue
+		}
+		if x, f := v[n-1], v[free-1]; f.hidden && !x.hidden || x.hidden == f.hidden && x.announced.After(f.announced) {
+			free = n
 		}
 	}
 	if free > 0 {
-		want[free] = true
+		restart = v[free-1].used
 	}
-	return want, free
+	for n := 1; n <= len(v) && free == 0; n++ {
+		if x := v[n-1]; !x.active && !x.running && !x.broken {
+			free = n
+		}
+	}
+	if free == 0 {
+		return want, 0, false
+	}
+	want[free] = true
+	if restart || !v[free-1].ready {
+		for n := 1; n <= len(v); n++ {
+			if idle(n) && !v[n-1].hidden { // a hidden one answers nobody
+				want[n] = true
+			}
+		}
+	}
+	return want, free, restart
 }
 
-// adjustSlots starts the wanted slots and stops the extra ones (unbound, or a spare free one) when
-// nobody is mirroring on them. Runs at startup, on every new binding and every second.
+// adjustSlots keeps the pool: it starts the wanted instances, restarts a used free one and stops
+// the extra idle ones. Runs at startup, on every accepted device and every second.
 func adjustSlots() {
 	adjustMu.Lock()
 	defer adjustMu.Unlock()
@@ -1081,17 +1343,19 @@ func adjustSlots() {
 		return
 	}
 	now := time.Now()
-	busy := map[int]bool{}
-	for _, s := range slots {
-		busy[s.N] = s.busyAt(now)
+	v := make([]slotView, len(slots))
+	for i, s := range slots {
+		v[i] = slotView{active: s.active, running: s.running, busy: s.busyAt(now), used: s.used(),
+			ready: s.cmd != nil && s.ready && !s.hidden, broken: s.crashStopped || s.crashedOut, hidden: s.cmd != nil && s.hidden, announced: s.announced}
 	}
 	current := currentFree
 	if current > 0 && !slots[current-1].active {
 		current = 0
 	}
-	want, free := wantedSlots(cfg.MaxSlots, cfg.Bindings, busy, current)
+	want, free, restart := poolPlan(cfg.MaxSlots, v, current)
 	currentFree = free
 	var show, start, hide []*Slot
+	var renew *Slot
 	for _, s := range slots {
 		switch {
 		case want[s.N] && !s.active:
@@ -1105,9 +1369,13 @@ func adjustSlots() {
 			s.running = true // UxPlay failed to start last time: try again
 			start = append(start, s)
 		case !want[s.N] && s.active && s.idleAt(now):
-			s.active, s.title = false, "" // empty title: updateMenu rewrites it next time it comes up
+			s.active, s.line = false, "" // empty line: updateMenu rewrites it next time it comes up
 			hide = append(hide, s)
 		}
+	}
+	if restart && free > 0 {
+		renew = slots[free-1]
+		requestRestartLocked(renew)
 	}
 	exe := uxplayExe
 	mu.Unlock()
@@ -1125,8 +1393,8 @@ func adjustSlots() {
 		s.item.Hide()
 		requestRestart(s) // the supervisor sees !active and exits
 	}
-	if len(show)+len(hide) > 0 {
-		updateStatus()
+	if renew != nil {
+		logf("slot %d: session over; restarting it for the next device", renew.N)
 	}
 }
 
@@ -1151,8 +1419,9 @@ func syncChecks() {
 }
 
 // setResolution and setFPS save the choice. They don't kill anything: watchWindows restarts each
-// slot with the new args as soon as nobody is mirroring on it (idle ones within a few seconds),
-// so a misclick never drops a live device. Slots stopped by a crash loop start again.
+// instance with the new args as soon as nobody is mirroring on it (idle ones within a few seconds),
+// so a misclick never drops a live device; a live one shows "… on reconnect" and offers Apply now.
+// Instances stopped by a crash loop start again.
 func setResolution(r string) {
 	mu.Lock()
 	same := cfg.Resolution == r
@@ -1164,7 +1433,8 @@ func setResolution(r string) {
 	mu.Unlock()
 	syncChecks()
 	if !same {
-		logf("resolution -> %s; applies to each slot when nobody is mirroring on it", r)
+		logf("resolution -> %s; applies to each instance when nobody is mirroring on it, or with Apply now", r)
+		refreshMenus()
 	}
 }
 
@@ -1179,28 +1449,49 @@ func setFPS(f int) {
 	mu.Unlock()
 	syncChecks()
 	if !same {
-		logf("fps -> %d; applies to each slot when nobody is mirroring on it", f)
+		logf("fps -> %d; applies to each instance when nobody is mirroring on it, or with Apply now", f)
+		refreshMenus()
 	}
 }
 
-func unbindSlot(s *Slot) {
+func refreshMenus() {
+	for _, s := range slots {
+		updateMenu(s)
+	}
+}
+
+// applyNow restarts one live instance right away with the new settings; the device mirrors again
+// to LIVE. Only offered while a change is waiting for it.
+func applyNow(s *Slot) {
 	mu.Lock()
-	b := cfg.Bindings[s.key()]
-	delete(cfg.Bindings, s.key())
-	if s.cmd != nil {
-		// The running UxPlay still has the binding: if the same device comes back before the slot
-		// restarts, don't bind it again (the operator just released the slot).
-		s.unbound = b.DeviceID
+	note, who := pendingNote(s), s.title
+	if note != "" {
+		requestRestartLocked(s)
 	}
-	saveConfig()
 	mu.Unlock()
-	logf("slot %d: unbound from %s, %s", s.N, b.Device, b.DeviceID)
-	updateMenu(s)
-	updateStatus()
-	adjustSlots()
+	if note != "" {
+		logf("slot %d: Apply now: restarting %s's instance with the new settings", s.N, who)
+	}
 }
 
-// requestRestartLocked kills the slot's UxPlay; the supervisor starts another with the current
+// forgetDevice removes the instance's device from the remembered devices (its window title is
+// then free for another device). The session in progress carries on.
+func forgetDevice(s *Slot) {
+	mu.Lock()
+	id := s.deviceID
+	d, ok := cfg.Devices[id]
+	if ok {
+		delete(cfg.Devices, id)
+		saveConfig()
+	}
+	mu.Unlock()
+	if ok {
+		logf("device forgotten: %s, %s", d.Name, id)
+	}
+	updateMenu(s)
+}
+
+// requestRestartLocked kills the instance's UxPlay; the supervisor starts another with the current
 // config. Call with mu held.
 func requestRestartLocked(s *Slot) {
 	select {
@@ -1218,11 +1509,12 @@ func requestRestart(s *Slot) {
 	mu.Unlock()
 }
 
-// resumeCrashedLocked starts again the slots stopped by a crash loop: the change may be the fix.
-// Call with mu held.
+// resumeCrashedLocked starts again the instances stopped by a crash loop: the change may be the
+// fix. Call with mu held.
 func resumeCrashedLocked() {
 	crashWarned = false
 	for _, s := range slots {
+		s.crashedOut = false
 		if s.active && s.crashStopped {
 			requestRestartLocked(s)
 		}
@@ -1233,6 +1525,7 @@ func restartAll() {
 	mu.Lock()
 	crashWarned = false
 	for _, s := range slots {
+		s.crashedOut = false
 		if s.active {
 			requestRestartLocked(s)
 		}
@@ -1240,9 +1533,9 @@ func restartAll() {
 	mu.Unlock()
 }
 
-// slotMAC gives each slot a fixed MAC of its own (AirPlay uses it as the receiver's deviceID):
-// with the same MAC everywhere, the device merges the receivers and shows a single LIVE. Fixed per
-// PC and slot so the device recognizes the same "LIVE N" across restarts. Locally administered bit.
+// slotMAC gives each instance a fixed MAC of its own (AirPlay uses it as the receiver's deviceID):
+// two instances with the same MAC would be one receiver to the device. Fixed per PC and instance.
+// Locally administered bit.
 func slotMAC(n int) string {
 	h := sha256.Sum256([]byte("iPhoneScreenshare|" + hostname + "|" + strconv.Itoa(n)))
 	b := h[:6]
@@ -1250,27 +1543,16 @@ func slotMAC(n int) string {
 	return fmt.Sprintf("%02x:%02x:%02x:%02x:%02x:%02x", b[0], b[1], b[2], b[3], b[4], b[5])
 }
 
-// slotArgs builds the slot's UxPlay command line from the current config; call with mu held.
+// slotArgs builds the instance's UxPlay command line from the current config; call with mu held.
 // The order is always the same (watchWindows compares it with the running process).
 func slotArgs(s *Slot) []string {
-	// -p: each slot with its own ports (n, n+1, n+2). -m: the slot's own MAC.
-	// -vs d3d11videosink: the sink UxPlay handles on Windows and CI tests (autovideosink would
-	// pick d3d12). It can be changed in extraArgs, which come last.
-	args := []string{"-n", s.name(), "-nh", "-p", strconv.Itoa(35000 + 10*s.N), "-m", slotMAC(s.N), "-vs", "d3d11videosink"}
+	// -n: the same name for every instance (only the free one is advertised). -p: each instance
+	// with its own ports (n, n+1, n+2). -m: its own MAC. -vs d3d11videosink: the sink UxPlay
+	// handles on Windows and CI tests (autovideosink would pick d3d12). -FPSdata: the client's
+	// frame rate reports, for the tray. extraArgs come last, so they override.
+	args := []string{"-n", cfg.Name, "-nh", "-p", strconv.Itoa(35000 + 10*s.N), "-m", slotMAC(s.N), "-vs", "d3d11videosink"}
 	args = append(args, resolutions[cfg.Resolution]...)
-	args = append(args, "-fps", strconv.Itoa(cfg.FPS))
-	v := validBindings()
-	for _, k := range sortedKeys(v) {
-		if k == s.key() {
-			// -nohold only on the slot locked to its owner: if Wi-Fi blips, it reconnects at once
-			// instead of waiting for the old session to expire (15 s). On the free slot the first
-			// device keeps the screen and a second one is refused (goes to the next LIVE) instead
-			// of dropping the first.
-			args = append(args, "-restrict", "-allow", v[k].DeviceID, "-nohold")
-		} else {
-			args = append(args, "-block", v[k].DeviceID)
-		}
-	}
+	args = append(args, "-fps", strconv.Itoa(cfg.FPS), "-FPSdata")
 	return append(args, cfg.ExtraArgs...)
 }
 
@@ -1283,142 +1565,208 @@ func containsAny(line string, parts []string) bool {
 	return false
 }
 
-// processLine updates the slot with one line of UxPlay output. UxPlay logs the connection request
-// before deciding whether to accept it; the device only counts (state, grace period, binding) once
-// the connection is accepted. Returns what to write to the app log and whether a new binding was
-// made. Call with mu held.
-func (s *Slot) processLine(line string, now time.Time) (msg string, bound bool) {
+// processLine updates the instance with one line of UxPlay output. UxPlay logs the connection
+// request before deciding whether to accept it; the device only counts (state, grace period, its
+// window title) once the connection is accepted. Returns what to write to the app log, whether a
+// device was accepted (the pool brings up the next free instance) and whether the raw line goes
+// to the log (FPS reports after the first one of the session don't). Call with mu held.
+func (s *Slot) processLine(line string, now time.Time) (msg string, accepted, keep bool) {
+	// Inside a report, a line that isn't XML is another thread's (UxPlay logs from several): it is
+	// handled as usual, so a report cut short never hides the session's lines.
+	xml := strings.HasPrefix(strings.TrimSpace(line), "<")
+	if (s.plist != nil && xml) || strings.Contains(line, "<?xml") || strings.Contains(line, "<plist") {
+		keep = !s.plistShown
+		s.plist = append(s.plist, line)
+		if strings.Contains(line, "</plist>") || len(s.plist) > 1000 {
+			fps, ok := parseFPSReport(strings.Join(s.plist, "\n"))
+			first := !s.plistShown
+			s.plist, s.plistShown, s.dropBlank = nil, true, !keep
+			switch {
+			case ok:
+				s.fps = fps
+				if first {
+					msg = fmt.Sprintf("slot %d: client reports %.0f fps (later reports are left out of the log)", s.N, fps)
+				}
+			case first:
+				msg = fmt.Sprintf("slot %d: client FPS report without a frame rate; later reports are left out of the log", s.N)
+			}
+		}
+		return msg, false, keep
+	}
+	if s.dropBlank {
+		s.dropBlank = false
+		if strings.TrimSpace(line) == "" {
+			return "", false, false
+		}
+	}
+	keep = true
+	switch {
+	case strings.Contains(line, "mDNS: hidden while mirroring"):
+		s.hidden = true
+		return fmt.Sprintf("slot %d: out of Screen Mirroring while %s mirrors", s.N, s.title), false, true
+	case strings.Contains(line, "mDNS: advertised at startup"):
+		s.ready, s.announced = true, now
+		return fmt.Sprintf("slot %d: in Screen Mirroring", s.N), false, true
+	case strings.Contains(line, "mDNS: announced again"):
+		// One of the patch's repeats (+1, +3 and +8 s after each announcement): the devices'
+		// caches hold the instance whose packet came last, so poolPlan compares this time.
+		if !s.hidden {
+			s.announced = now
+		}
+		return "", false, true
+	case strings.Contains(line, "mDNS: mirroring ended"):
+		// The mirror thread ended (the most reliable stop point, whatever the reason): the session
+		// is over even if no other line said so.
+		var notes []string
+		if s.mirroring {
+			s.mirroring, s.ended = false, now
+			s.state, s.color = "stopped: mirror again on the device", "yellow"
+			notes = append(notes, s.title+" stopped mirroring")
+		}
+		if strings.Contains(line, "advertised again") {
+			// Back in Screen Mirroring, and the devices now resolve LIVE to this instance (it
+			// announced last): it is free for the next device, the same one or another, without a
+			// restart; the pool takes the other idle one down. The device and title stay: a frozen
+			// window UxPlay may leave open keeps its name, and if that device reconnects on
+			// another instance, accept restarts this one so there is no duplicate.
+			s.hidden, s.ready, s.announced, s.readvertised = false, true, now, true
+			s.fps, s.width, s.height, s.codec = 0, 0, 0, ""
+			s.state, s.color = "waiting", "blue"
+			notes = append(notes, "back in Screen Mirroring")
+			if s.pending || !slices.Equal(slotArgs(s), s.args) {
+				// New settings wait for this instance ("SD on reconnect"): it announced last, so a
+				// device that reconnects now gets it. Restart at once, while nobody is connected,
+				// instead of after the grace period (watchWindows), which would leave the old args
+				// for the next device or drop its handshake. The ports stay, so caches stay valid.
+				s.pending = false
+				requestRestartLocked(s)
+				notes = append(notes, "restarting to apply the config")
+			}
+		} else {
+			s.hidden = true // announcing again failed: the instance restarts before serving another device
+		}
+		if notes == nil {
+			return "", false, true
+		}
+		return fmt.Sprintf("slot %d: %s", s.N, strings.Join(notes, "; ")), false, true
+	}
 	if m := reSocket.FindStringSubmatch(line); m != nil {
 		s.newSock = m[1]
-		return "", false
+		return "", false, true
 	}
 	if codec, w, h, ok := parseGeometry(line); ok {
 		if w == s.width && h == s.height && codec == s.codec {
-			return "", false
+			return "", false, true
 		}
 		if w != s.width || h != s.height {
 			s.geometryAt = now
 		}
 		s.width, s.height, s.codec = w, h, codec
-		return fmt.Sprintf("slot %d: video %s %s", s.N, codec, orientation(w, h)), false
+		return fmt.Sprintf("slot %d: video %s %s", s.N, codec, orientation(w, h)), false, true
 	}
 	if m := reConnection.FindStringSubmatch(line); m != nil {
-		s.candName, s.candID, s.candSock = m[1], m[3], s.newSock
-		return "", false
+		s.candName, s.candID, s.candSock, s.candAt = m[1], m[3], s.newSock, now
+		return "", false, true
 	}
 	if s.candID != "" && containsAny(line, refusals) {
 		msg = fmt.Sprintf("slot %d: refused %s, %s", s.N, s.candName, s.candID)
 		s.candName, s.candID = "", ""
-		return msg, false
+		return msg, false, true
 	}
 	if s.candID != "" && containsAny(line, []string{"Client identified as", "starting mirroring", "Begin streaming"}) {
-		if s.mirroring || now.Sub(s.sockEnded) < 5*time.Second {
-			s.takeover = true // new session while the previous one was still live or just closed (-nohold)
-		}
-		msg, bound = s.accept(now)
+		msg, accepted = s.accept(now), true
 	}
 	if strings.Contains(line, "Begin streaming to GStreamer video pipeline") {
 		s.mirroring, s.videoStart = true, now
 		s.state, s.color = "live", "green"
-		s.ignoreEndsUntil = time.Time{}
-		if s.takeover {
-			s.takeover, s.ignoreEndsUntil = false, now.Add(3*time.Second)
-		}
-		return msg, bound
+		return msg, accepted, true
 	}
 	if s.mirroring {
 		m := reClosed.FindStringSubmatch(line)
-		if containsAny(line, endings) && now.Before(s.ignoreEndsUntil) {
-			// end of the session that was taken over, logged after the new one started; the new
-			// one's end is still seen through its socket (Connection closed on socket).
-			return fmt.Sprintf("slot %d: end of the previous session ignored, %s is still live", s.N, s.device), bound
-		}
 		if containsAny(line, endings) || (m != nil && m[1] == s.sock) {
 			s.mirroring, s.ended = false, now
-			if m != nil {
-				s.sockEnded = now
-			}
 			s.state, s.color = "stopped: mirror again on the device", "yellow"
-			return fmt.Sprintf("slot %d: %s stopped mirroring", s.N, s.device), bound
+			return fmt.Sprintf("slot %d: %s stopped mirroring", s.N, s.title), accepted, true
 		}
 	}
-	return msg, bound
+	return msg, accepted, true
 }
 
-// accept takes the device that asked to connect and binds the slot if it is free.
+// accept takes the device that asked to connect: it remembers the device, gives the session its
+// window title and, if the same device still has an older session on another instance (it
+// reconnected after a network blip, and that window is frozen), restarts that instance at once.
 // Call with mu held.
-func (s *Slot) accept(now time.Time) (string, bool) {
+func (s *Slot) accept(now time.Time) string {
 	device, id := s.candName, s.candID
 	s.candName, s.candID = "", ""
-	s.sock, s.device, s.connected = s.candSock, device, now
-	s.width, s.height, s.codec = 0, 0, ""
+	var notes []string
+	for _, o := range slots {
+		if o != s && o.cmd != nil && o.deviceID == id {
+			if o.mirroring {
+				notes = append(notes, fmt.Sprintf("; its old session on slot %d is restarted", o.N))
+			}
+			// The window is going away: its title goes to the new session. Its session is over now
+			// (not when the process is gone), so the pool takes the restarting instance as the
+			// free one instead of starting another.
+			o.title, o.mirroring, o.ready = "", false, false
+			o.connected, o.ended = time.Time{}, time.Time{}
+			o.state, o.color = "restarting", "gray"
+			requestRestartLocked(o)
+		}
+	}
+	s.sock, s.device, s.deviceID, s.connected, s.readvertised = s.candSock, device, id, now, false
+	s.width, s.height, s.codec, s.fps, s.plistShown = 0, 0, "", 0, false
 	s.state, s.color = "connecting", "yellow"
-	v := validBindings()
-	owner := ""
-	for _, k := range sortedKeys(v) {
-		if v[k].DeviceID == id {
-			owner = k
+	open := map[string]string{}
+	for _, o := range slots {
+		if o != s && o.cmd != nil && o.deviceID != "" && o.title != "" {
+			open[o.title] = o.deviceID
 		}
 	}
-	_, taken := v[s.key()]
-	// UxPlay only accepts a device that isn't the slot's while it still runs with the args from
-	// before the binding (no -restrict/-block). That connection doesn't count: restart now,
-	// without waiting for the grace period, or it would stay live on another device's OBS source.
-	switch {
-	case cfg.MaxSlots == 1 || owner == s.key():
-		return fmt.Sprintf("slot %d: %s connected", s.N, device), false
-	case owner != "":
-		requestRestartLocked(s)
-		return fmt.Sprintf("slot %d: %s connected but belongs to slot %s; restarting this slot to refuse it",
-			s.N, device, owner), false
-	case taken:
-		requestRestartLocked(s)
-		return fmt.Sprintf("slot %d: %s connected but the slot belongs to %s; restarting the slot to refuse it",
-			s.N, device, v[s.key()].Device), false
-	case id == s.unbound:
-		return fmt.Sprintf("slot %d: %s connected; it was unbound from this slot and is only bound again after the slot restarts",
-			s.N, device), false
+	d, known := cfg.Devices[id]
+	s.title = pickTitle(id, displayName(id, device), cfg.Devices, open)
+	n := d
+	if strings.TrimSpace(device) != "" {
+		n.Name = device
 	}
-	for k, x := range cfg.Bindings { // old binding of the same device outside maxSlots
-		if x.DeviceID == id {
-			delete(cfg.Bindings, k)
-		}
+	n.Window = s.title
+	if !known || n != d {
+		cfg.Devices[id] = n
+		saveConfig()
 	}
-	cfg.Bindings[s.key()] = Binding{DeviceID: id, Device: device}
-	return fmt.Sprintf("slot %d: bound to %s, deviceID %s", s.N, device, id), true
+	return fmt.Sprintf("slot %d: %s connected, deviceID %s, window %q%s", s.N, device, id, s.title, strings.Join(notes, ""))
 }
 
-// readOutput copies UxPlay's output to the log and tracks connections, mirroring and bindings.
-// It closes done when finished: the supervisor waits for it, so no line from the old process
-// lands in the new process's state.
+// readOutput copies UxPlay's output to the log and tracks connections, mirroring and the client's
+// frame rate. It closes done when finished: the supervisor waits for it, so no line from the old
+// process lands in the new process's state.
 func readOutput(s *Slot, r io.Reader, done chan<- struct{}) {
 	defer close(done)
 	sc := bufio.NewScanner(r)
 	for sc.Scan() {
 		line := sc.Text()
-		fmt.Fprintf(logFile, "[slot %d] %s\n", s.N, line)
 		mu.Lock()
-		before := [4]any{s.state, s.width, s.height, s.codec}
+		before := [6]any{s.state, s.width, s.height, s.codec, math.Round(s.fps), s.title}
 		size := [2]int{s.width, s.height}
-		msg, bound := s.processLine(line, time.Now())
-		if bound {
-			saveConfig()
-		}
-		changed := before != [4]any{s.state, s.width, s.height, s.codec}
+		msg, accepted, keep := s.processLine(line, time.Now())
+		changed := before != [6]any{s.state, s.width, s.height, s.codec, math.Round(s.fps), s.title}
 		resized := size != [2]int{s.width, s.height} && s.width > 0 && s.height > 0
 		mu.Unlock()
+		if keep {
+			fmt.Fprintf(logFile, "[slot %d] %s\n", s.N, line)
+		}
 		if resized {
 			fitSoon(s) // rotation: fit as soon as the geometry settles, not on the next tick
 		}
 		if msg != "" {
 			logf("%s", msg)
 		}
-		if changed || bound {
+		if changed || accepted {
 			updateMenu(s)
 		}
-		if bound {
-			updateStatus()
-			adjustSlots() // brings up the next free slot
+		if accepted {
+			adjustSlots() // brings up the next free instance
+			refreshMenus()
 		}
 	}
 }
@@ -1447,7 +1795,10 @@ func supervise(s *Slot, exe string) {
 			return
 		}
 		args := slotArgs(s)
-		s.pending, s.unbound, s.takeover, s.ignoreEndsUntil, s.sockEnded = false, "", false, time.Time{}, time.Time{}
+		s.pending, s.hidden, s.ready, s.readvertised, s.argsRes, s.argsFPS = false, false, false, false, cfg.Resolution, cfg.FPS
+
+		s.device, s.deviceID, s.title, s.fps, s.plist, s.plistShown, s.dropBlank = "", "", "", 0, nil, false, false
+		s.connected, s.ended, s.videoStart = time.Time{}, time.Time{}, time.Time{}
 		s.mirroring, s.candID, s.candName, s.sock, s.newSock = false, "", "", "", ""
 		s.width, s.height, s.codec = 0, 0, ""
 		mu.Unlock()
@@ -1514,7 +1865,7 @@ func supervise(s *Slot, exe string) {
 		}
 		if quickCrashes >= 3 {
 			mu.Lock()
-			s.crashStopped = true
+			s.crashStopped, s.crashedOut = true, true
 			first := !crashWarned // one popup for all the slots that stop for the same cause
 			crashWarned = true
 			mu.Unlock()
@@ -1545,16 +1896,16 @@ var (
 	enumWindowCallback    = windows.NewCallback(func(h windows.HWND, _ uintptr) uintptr {
 		var pid uint32
 		windows.GetWindowThreadProcessId(h, &pid)
-		if windows.IsWindowVisible(h) {
+		if windows.IsWindowVisible(h) && isVideoWindow(h) {
 			windowsByPID[pid] = append(windowsByPID[pid], h)
 		}
 		return 1
 	})
 )
 
-// watchWindows gives each video window the fixed title "Slot N" (OBS finds the source by title),
-// flags video that arrived without a window and restarts idle slots whose args changed (new
-// binding, unbinding, config) or that are pending (network changed).
+// watchWindows gives each video window the title of its session, the device's name (OBS finds the
+// source by title), flags video that arrived without a window and restarts idle instances whose
+// args changed (config) or that are pending (network changed).
 func watchWindows() {
 	for range time.Tick(time.Second) {
 		byPID := visibleWindows()
@@ -1562,15 +1913,15 @@ func watchWindows() {
 		adjustSlots()
 		for _, s := range slots {
 			mu.Lock()
-			cmd, active := s.cmd, s.active
+			cmd, active, title := s.cmd, s.active, s.title
 			mu.Unlock()
 			if !active || cmd == nil || cmd.Process == nil {
 				continue
 			}
 			wins := byPID[uint32(cmd.Process.Pid)]
 			for _, h := range wins {
-				if windowTitle(h) != s.window() {
-					setWindowTitle(h, s.window())
+				if title != "" && windowTitle(h) != title {
+					setWindowTitle(h, title)
 				}
 			}
 			fitWindows(s, wins, time.Now())
@@ -1594,7 +1945,7 @@ func watchWindows() {
 			}
 			mu.Unlock()
 			if restart {
-				logf("slot %d: applying config/bindings, nobody mirroring", s.N)
+				logf("slot %d: applying the config, nobody mirroring", s.N)
 			}
 			updateMenu(s)
 		}
@@ -1641,7 +1992,7 @@ const (
 )
 
 // watchNewWindows hears from Windows as soon as a UxPlay window is created or shown and gives it
-// the "Slot N" title and the video's shape right then (onWindowEvent), so the window isn't seen at
+// its session's title and the video's shape right then (onWindowEvent), so the window isn't seen at
 // the sink's size and resized afterwards. The hook is out of context (no DLL in UxPlay): its events
 // arrive on this thread's message loop. watchWindows stays as the fallback.
 func watchNewWindows() {
@@ -1677,12 +2028,13 @@ func watchNewWindows() {
 	}
 }
 
-// onWindowEvent handles a window just created (still hidden) or shown. A top-level window with a
-// title bar of a slot's UxPlay gets the slot's title. The video sink resizes its window to the full
-// video size right before it shows it, which undoes any fit made earlier, and the show event
-// arrives once the window is already on screen. So when the geometry is already known (UxPlay logs
-// it before the window exists), the sink's window is made transparent while it is still hidden,
-// fitted when it is shown, and made opaque once the fit has landed: it is first seen in shape.
+// onWindowEvent handles a window just created (still hidden) or shown. Only the video sink's own
+// window (isVideoWindow) of an instance's UxPlay is touched: it gets the session's title. The video
+// sink resizes its window to the full video size right before it shows it, which undoes any fit
+// made earlier, and the show event arrives once the window is already on screen. So when the
+// geometry is already known (UxPlay logs it before the window exists), the sink's window is made
+// transparent while it is still hidden, fitted when it is shown, and made opaque once the fit has
+// landed: it is first seen in shape.
 func onWindowEvent(h windows.HWND, shown bool) {
 	const gwlStyle, wsCaption = ^uintptr(15), 0x00C00000 // -16
 	parent, _, _ := getAncestor.Call(uintptr(h), 1)      // GA_PARENT
@@ -1693,28 +2045,29 @@ func onWindowEvent(h windows.HWND, shown bool) {
 	windows.GetWindowThreadProcessId(h, &pid)
 	var s *Slot
 	var video [2]int
+	var title string
 	mu.Lock()
 	for _, o := range slots {
 		if o.active && o.cmd != nil && o.cmd.Process != nil && uint32(o.cmd.Process.Pid) == pid {
-			s, video = o, [2]int{o.width, o.height}
+			s, video, title = o, [2]int{o.width, o.height}, o.title
 		}
 	}
 	mu.Unlock()
-	if s == nil {
-		return
+	if s == nil || !isVideoWindow(h) {
+		return // tooltips (the close button's), IME and tool windows are left alone
 	}
 	if style, _, _ := getWindowLongPtr.Call(uintptr(h), gwlStyle); style&wsCaption == 0 {
 		if shown {
 			revealWindow(h) // went full screen before its show event was handled
 		}
-		return // not a video window, or already full screen
+		return // already full screen
 	}
-	if windowTitle(h) != s.window() {
-		setWindowTitle(h, s.window())
+	if title != "" && windowTitle(h) != title {
+		setWindowTitle(h, title)
 	}
 	known := video[0] > 0 && video[1] > 0
 	if !shown {
-		if known && windowClass(h) == sinkWindowClass && !windows.IsWindowVisible(h) {
+		if known && !windows.IsWindowVisible(h) {
 			hideWindow(h)
 		}
 		return
@@ -1743,13 +2096,28 @@ func onWindowEvent(h windows.HWND, shown bool) {
 	}()
 }
 
-// sinkWindowClass is d3d11videosink's window class.
-const sinkWindowClass = "GSTD3D11"
+// videoWindowClasses are the window classes of the video sink the app runs UxPlay with
+// (d3d11videosink, -vs in slotArgs). UxPlay's other windows (the close button's tooltip, IME
+// windows) are not video, and neither are the windows of another sink set in extraArgs.
+var videoWindowClasses = []string{"GSTD3D11"}
 
 const (
-	gwlExStyle  = ^uintptr(19) // -20
-	wsExLayered = 0x00080000
+	gwlExStyle   = ^uintptr(19) // -20
+	wsExLayered  = 0x00080000
+	wsExToolWin  = 0x00000080
+	wsExNoActive = 0x08000000
 )
+
+// videoClass tells whether a window with this class and extended style is the video sink's own
+// window: the only one that is fitted, renamed, hidden and revealed.
+func videoClass(class string, ex uintptr) bool {
+	return slices.Contains(videoWindowClasses, class) && ex&(wsExToolWin|wsExNoActive) == 0
+}
+
+func isVideoWindow(h windows.HWND) bool {
+	ex, _, _ := getWindowLongPtr.Call(uintptr(h), gwlExStyle)
+	return videoClass(windowClass(h), ex)
+}
 
 var (
 	getClassName      = user32.NewProc("GetClassNameW")
