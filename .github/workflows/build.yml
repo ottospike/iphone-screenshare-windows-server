@@ -9,14 +9,19 @@ on:
 
 permissions:
   contents: write
+  actions: read # SignPath reads the job and downloads the unsigned artifact with this token
 
 env:
-  # Commit do FDH2/UxPlay com o mDNS embutido (>= 1.74, ainda sem release). Trocar para atualizar.
+  # FDH2/UxPlay commit with the embedded mDNS (>= 1.74, not released yet). Change it to update.
   UXPLAY_REF: 28ed70a9876fe3f5864479f4e0d07abe4678383a
 
 jobs:
   windows:
     runs-on: windows-latest
+    env:
+      # Only exposed on v* tags (releases), so branch and PR code never sees it. Empty without the
+      # secret (forks) or on other refs: the signing steps are skipped and the build stays unsigned.
+      SIGNPATH_API_TOKEN: ${{ startsWith(github.ref, 'refs/tags/v') && secrets.SIGNPATH_API_TOKEN || '' }}
     steps:
       - uses: actions/checkout@v4
 
@@ -38,26 +43,84 @@ jobs:
             mingw-w64-ucrt-x86_64-gst-plugins-bad
             mingw-w64-ucrt-x86_64-gst-libav
 
-      - name: Compilar UxPlay e montar bundle
+      - name: Build UxPlay and the bundle
         shell: msys2 {0}
-        run: bash ci/montar-bundle.sh
+        run: bash ci/build-bundle.sh
 
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
 
-      - name: Compilar iPhoneScreenshareServer.exe
+      # After the bundle: //go:embed bundle/uxplay.zip needs the file to compile.
+      - name: go vet
+        run: go vet ./...
+
+      - name: go test
+        run: go test -count=1 ./...
+
+      - name: Build iPhoneScreenshareServer.exe
         run: go build -ldflags "-H windowsgui -s -w" -o dist/iPhoneScreenshareServer.exe .
 
-      - name: Teste de fumaca
-        run: ./ci/testar.ps1
+      - name: Build fake uxplay (test without a device)
+        run: go build -o "$env:RUNNER_TEMP\fake\uxplay.exe" ./ci/fake-uxplay
+
+      - name: Smoke test
+        run: ./ci/smoke-test.ps1
+
+      - name: Check SignPath settings
+        if: env.SIGNPATH_API_TOKEN != '' && startsWith(github.ref, 'refs/tags/v')
+        env:
+          SIGNPATH_ORGANIZATION_ID: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+        run: |
+          if (-not $env:SIGNPATH_ORGANIZATION_ID) { throw 'SIGNPATH_API_TOKEN is set but the SIGNPATH_ORGANIZATION_ID repository variable is missing' }
+
+      - name: Upload unsigned exe for signing
+        id: unsigned
+        if: env.SIGNPATH_API_TOKEN != '' && startsWith(github.ref, 'refs/tags/v')
+        uses: actions/upload-artifact@v4
+        with:
+          name: iPhoneScreenshareServer-unsigned
+          path: dist/iPhoneScreenshareServer.exe
+          overwrite: true # a re-run of the job replaces the artifact of the failed attempt
+
+      - name: Sign with SignPath
+        if: env.SIGNPATH_API_TOKEN != '' && startsWith(github.ref, 'refs/tags/v')
+        uses: signpath/github-action-submit-signing-request@v1
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: ${{ vars.SIGNPATH_PROJECT_SLUG || 'iphone-screenshare-windows-server' }}
+          signing-policy-slug: ${{ vars.SIGNPATH_SIGNING_POLICY_SLUG || 'release-signing' }}
+          github-artifact-id: ${{ steps.unsigned.outputs.artifact-id }}
+          wait-for-completion: true
+          # Each release is approved by hand in SignPath; wait up to an hour for it.
+          wait-for-completion-timeout-in-seconds: 3600
+          output-artifact-directory: signed
+
+      - name: Use the signed exe
+        if: env.SIGNPATH_API_TOKEN != '' && startsWith(github.ref, 'refs/tags/v')
+        env:
+          SIGNING_POLICY: ${{ vars.SIGNPATH_SIGNING_POLICY_SLUG || 'release-signing' }}
+        run: |
+          $exe = Get-ChildItem signed -Recurse -Filter iPhoneScreenshareServer.exe | Select-Object -First 1
+          if (-not $exe) { throw 'signed exe not found in the SignPath output' }
+          $sig = Get-AuthenticodeSignature $exe.FullName
+          if (-not $sig.SignerCertificate) { throw "exe is not signed: $($sig.Status)" }
+          # Only the release certificate chains to a trusted root; a test-signing policy's doesn't.
+          if ($sig.Status -ne 'Valid') {
+            if ($env:SIGNING_POLICY -eq 'release-signing') { throw "signature is $($sig.Status)" }
+            Write-Warning "signature is $($sig.Status) with policy $($env:SIGNING_POLICY), not trusted by Windows"
+          }
+          Write-Host "signed by $($sig.SignerCertificate.Subject)"
+          Copy-Item $exe.FullName dist/iPhoneScreenshareServer.exe -Force
 
       - uses: actions/upload-artifact@v4
         with:
           name: iPhoneScreenshareServer
           path: dist/iPhoneScreenshareServer.exe
+          overwrite: true
 
-      - name: Publicar release
+      - name: Publish release
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
