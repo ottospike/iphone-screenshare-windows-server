@@ -5,8 +5,9 @@
 #    without crashes, when there is no binding;
 # 4) with a fake uxplay (ci/fake-uxplay, built to $env:RUNNER_TEMP\fake) that simulates a device:
 #    visible video window, slot not restarted right after the connection, binding saved, new free
-#    slot with -block for the bound device, the source geometry/rotation read from the log, and the
-#    video window fitted to the video (client area with the portrait, then the landscape, ratio).
+#    slot with -block for the bound device, the codec and source geometry/rotation read from the log,
+#    the video window already in the video's shape the first time it becomes visible, and fitted
+#    again on rotation (client area with the portrait, then the landscape, ratio).
 $ErrorActionPreference = 'Stop'
 $b = Resolve-Path 'build/uxplay'
 $env:PATH = "$b\bin;C:\Windows\System32;C:\Windows"
@@ -37,7 +38,7 @@ function Wait-UxPlay([int]$seconds, [int]$count = 1) {
 
 # Each resolution preset the tray offers (Native, FHD, HD, SD) must be accepted at startup.
 $presets = @(
-  @('-h265', '-s', '3840x3840', '-fps', '60'),
+  @('-h265', '-s', '2880x2880', '-fps', '60'),
   @('-s', '1920x1920', '-fps', '60'),
   @('-s', '1280x1280', '-fps', '30'),
   @('-s', '854x854', '-fps', '30')
@@ -65,7 +66,7 @@ try {
   if ($pid20 -ne $pid40) { throw "the free slot's uxplay was restarted ($pid20 -> $pid40)" }
   $l = Get-Content $appLog -Encoding UTF8
   if ($l -match 'UxPlay crashed|ERROR starting') { throw 'uxplay crashed during the test' }
-  if (-not ($l -match 'slot 1: starting .* -m .* -h265 -s 3840x3840 -fps 60')) { throw 'slot 1 started without -m or the default resolution' }
+  if (-not ($l -match 'slot 1: starting .* -m .* -h265 -s 2880x2880 -fps 60')) { throw 'slot 1 started without -m or the default resolution' }
 } finally {
   Get-Content $appLog -Encoding UTF8 -ErrorAction SilentlyContinue | Select-Object -Last 40
   Stop-Process -Id $app.Id -Force -ErrorAction SilentlyContinue
@@ -99,8 +100,8 @@ try {
     $m2 = [regex]::Match($s2[0], ' -m (\S+)').Groups[1].Value
     if (-not $m1 -or $m1 -eq $m2) { $errors += "slots with the same MAC ($m1 / $m2)" }
   }
-  if (-not ($l -match 'slot 1: video portrait 1320.2868')) { $errors += 'portrait geometry not read' }
-  if (-not ($l -match 'slot 1: video landscape 2868.1320')) { $errors += 'rotation not read' }
+  if (-not ($l -match 'slot 1: video H\.264 portrait 1320.2868')) { $errors += 'codec and portrait geometry not read' }
+  if (-not ($l -match 'slot 1: video H\.264 landscape 2868.1320')) { $errors += 'rotation not read' }
   if ($windows -notcontains 'Slot 1') { $errors += "window not renamed to 'Slot 1' (found: $($windows -join ', '))" }
   # The fake prints its client size on every resize: after the portrait geometry the app fits the
   # window to 1320x2868's ratio, after the rotation to 2868x1320's, never larger than the video.
@@ -110,11 +111,17 @@ try {
   for ($i = 0; $i -lt $sizes.Count; $i++) { if (& $fit $sizes[$i][0] $sizes[$i][1] 1320 2868) { $p = $i; break } }
   $q = -1
   for ($i = [math]::Max($p, 0); $i -lt $sizes.Count; $i++) { if (& $fit $sizes[$i][0] $sizes[$i][1] 2868 1320) { $q = $i } }
+  # Like d3d11videosink, the fake sizes its hidden window to the full video and then shows it: the
+  # window must already have the video's shape the first time it is seen (visible and not
+  # transparent), never be seen at the sink's size and resized afterwards.
+  $seen = @($l | ForEach-Object { if ($_ -match 'FAKE: seen client (\d+)x(\d+)') { ,@([int]$Matches[1], [int]$Matches[2]) } })
+  if ($seen.Count -lt 1) { $errors += 'the fake window was never seen' }
+  elseif (-not (& $fit $seen[0][0] $seen[0][1] 1320 2868)) { $errors += "window first seen at $($seen[0] -join 'x'), not in the portrait video's shape" }
   if ($p -lt 0) { $errors += "window not fitted to the portrait video (client sizes: $(($sizes | ForEach-Object { $_ -join 'x' }) -join ', '))" }
   elseif ($q -le $p) { $errors += "window not fitted to the landscape video after the rotation (client sizes: $(($sizes | ForEach-Object { $_ -join 'x' }) -join ', '))" }
   if (-not ($l -match 'slot 1: window fitted: client')) { $errors += 'window fit not logged' }
   if ($errors) { throw ($errors -join '; ') }
-  Write-Host 'fake uxplay: binding, new slot, MACs, geometry, window Slot 1 fitted to the video OK'
+  Write-Host 'fake uxplay: binding, new slot, MACs, codec, geometry, window Slot 1 shown in shape and fitted on rotation OK'
 } finally {
   Get-Content "$dir\app.log" -Encoding UTF8 -ErrorAction SilentlyContinue | Select-Object -Last 40
   Stop-Process -Id $app.Id -Force -ErrorAction SilentlyContinue

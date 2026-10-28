@@ -81,9 +81,11 @@ type legacyConfig struct {
 }
 
 // The receiver must declare a display size in AirPlay; the sender scales its screen to fit it.
-// A square request lets portrait and landscape devices both fit at their full size.
+// A square request lets portrait and landscape devices both fit at their full size. The sender
+// scales up too: 3840 made a 1320×2868 iPhone send 1768×3840. 2880 is about a recent iPhone's
+// native height and still fits an iPad Pro's 2752.
 var resolutions = map[string][]string{
-	"native": {"-h265", "-s", "3840x3840"},
+	"native": {"-h265", "-s", "2880x2880"},
 	"fhd":    {"-s", "1920x1920"},
 	"hd":     {"-s", "1280x1280"},
 	"sd":     {"-s", "854x854"},
@@ -106,7 +108,7 @@ var (
 	reConnection = regexp.MustCompile(`connection request from (.*) \((.*)\) with deviceID = (\S+)`)
 	reSocket     = regexp.MustCompile(`Accepted IPv\d client on socket (\d+)`)
 	reClosed     = regexp.MustCompile(`Connection closed on socket (\d+)`)
-	reGeometry   = regexp.MustCompile(`codec is h26[45]: geometry is \(w,h\)=\((\d+),(\d+)\) \(source\)`)
+	reGeometry   = regexp.MustCompile(`codec is (h26[45]): geometry is \(w,h\)=\((\d+),(\d+)\) \(source\)`)
 	// Lines UxPlay writes when it refuses the connection it just logged.
 	refusals = []string{"DENIED", "have been restricted", "rejecting new connection", "Conflict: Server is connected"}
 	// Lines that end mirroring (the window keeps the last frame frozen, so it can't be used).
@@ -170,6 +172,7 @@ type Slot struct {
 	ended      time.Time // when the last mirroring session ended
 	width      int       // source video size from the last geometry line
 	height     int
+	codec      string    // "H.264" or "H.265", from the last geometry line
 	geometryAt time.Time // when the geometry last changed
 	pending    bool      // restart when idle even without arg changes (network changed)
 	// With -nohold, a reconnecting device takes over the session still running; UxPlay may log the
@@ -183,8 +186,8 @@ type Slot struct {
 	unbound         string // deviceID unbound while UxPlay was still running; not rebound until restart
 	crashStopped    bool   // stopped after 3 quick crashes; waits for Restart or a settings change
 
-	// fitted is the video size each of the slot's windows was last fitted to; only watchWindows
-	// touches it, so a window is fitted when first seen and on each new geometry, not in between.
+	// fitted is the video size each of the slot's windows was last fitted to, so a window is fitted
+	// when it shows up and on each new geometry, not in between. Guarded by fitMu.
 	fitted map[windows.HWND][2]int
 
 	title  string // last text set on the menu item (empty = forces SetTitle when shown)
@@ -232,15 +235,16 @@ func orientation(w, h int) string {
 	return fmt.Sprintf("square %d×%d", w, h)
 }
 
-// parseGeometry reads the source size from UxPlay's "codec is h264: geometry is ..." line.
-func parseGeometry(line string) (w, h int, ok bool) {
+// parseGeometry reads the codec ("H.264" or "H.265") and the source size from UxPlay's
+// "codec is h264: geometry is ..." line.
+func parseGeometry(line string) (codec string, w, h int, ok bool) {
 	m := reGeometry.FindStringSubmatch(line)
 	if m == nil {
-		return 0, 0, false
+		return "", 0, 0, false
 	}
-	w, _ = strconv.Atoi(m[1])
-	h, _ = strconv.Atoi(m[2])
-	return w, h, true
+	w, _ = strconv.Atoi(m[2])
+	h, _ = strconv.Atoi(m[3])
+	return "H." + m[1][1:], w, h, true
 }
 
 func main() {
@@ -884,6 +888,7 @@ func onReady() {
 	updateStatus()
 	adjustSlots()
 	go watchNetwork()
+	go watchNewWindows()
 	go watchWindows()
 	if publicNetwork() {
 		// The firewall rule applies to any profile (local subnet only), so just note it.
@@ -920,7 +925,7 @@ func openInNotepad(path string) {
 	}
 }
 
-// slotTitle is the menu line of a slot, e.g. "LIVE 2 · Otavio's iPhone · live · portrait 1320×2868".
+// slotTitle is the menu line of a slot, e.g. "LIVE 2 · Otavio's iPhone · live · H.265 · portrait 1320×2868".
 // Call with mu held.
 func slotTitle(s *Slot) (string, bool) {
 	b, bound := validBindings()[s.key()]
@@ -937,6 +942,9 @@ func slotTitle(s *Slot) (string, bool) {
 	}
 	t := fmt.Sprintf("%s · %s · %s", s.name(), who, s.state)
 	if o := orientation(s.width, s.height); o != "" && s.mirroring {
+		if s.codec != "" {
+			t += " · " + s.codec
+		}
 		t += " · " + o
 	}
 	return t, bound
@@ -1284,12 +1292,15 @@ func (s *Slot) processLine(line string, now time.Time) (msg string, bound bool) 
 		s.newSock = m[1]
 		return "", false
 	}
-	if w, h, ok := parseGeometry(line); ok {
-		if w == s.width && h == s.height {
+	if codec, w, h, ok := parseGeometry(line); ok {
+		if w == s.width && h == s.height && codec == s.codec {
 			return "", false
 		}
-		s.width, s.height, s.geometryAt = w, h, now
-		return fmt.Sprintf("slot %d: video %s", s.N, orientation(w, h)), false
+		if w != s.width || h != s.height {
+			s.geometryAt = now
+		}
+		s.width, s.height, s.codec = w, h, codec
+		return fmt.Sprintf("slot %d: video %s %s", s.N, codec, orientation(w, h)), false
 	}
 	if m := reConnection.FindStringSubmatch(line); m != nil {
 		s.candName, s.candID, s.candSock = m[1], m[3], s.newSock
@@ -1340,7 +1351,7 @@ func (s *Slot) accept(now time.Time) (string, bool) {
 	device, id := s.candName, s.candID
 	s.candName, s.candID = "", ""
 	s.sock, s.device, s.connected = s.candSock, device, now
-	s.width, s.height = 0, 0
+	s.width, s.height, s.codec = 0, 0, ""
 	s.state, s.color = "connecting", "yellow"
 	v := validBindings()
 	owner := ""
@@ -1387,13 +1398,18 @@ func readOutput(s *Slot, r io.Reader, done chan<- struct{}) {
 		line := sc.Text()
 		fmt.Fprintf(logFile, "[slot %d] %s\n", s.N, line)
 		mu.Lock()
-		before := [3]any{s.state, s.width, s.height}
+		before := [4]any{s.state, s.width, s.height, s.codec}
+		size := [2]int{s.width, s.height}
 		msg, bound := s.processLine(line, time.Now())
 		if bound {
 			saveConfig()
 		}
-		changed := before != [3]any{s.state, s.width, s.height}
+		changed := before != [4]any{s.state, s.width, s.height, s.codec}
+		resized := size != [2]int{s.width, s.height} && s.width > 0 && s.height > 0
 		mu.Unlock()
+		if resized {
+			fitSoon(s) // rotation: fit as soon as the geometry settles, not on the next tick
+		}
 		if msg != "" {
 			logf("%s", msg)
 		}
@@ -1433,7 +1449,7 @@ func supervise(s *Slot, exe string) {
 		args := slotArgs(s)
 		s.pending, s.unbound, s.takeover, s.ignoreEndsUntil, s.sockEnded = false, "", false, time.Time{}, time.Time{}
 		s.mirroring, s.candID, s.candName, s.sock, s.newSock = false, "", "", "", ""
-		s.width, s.height = 0, 0
+		s.width, s.height, s.codec = 0, 0, ""
 		mu.Unlock()
 
 		cmd := uxplayCmd(exe, args)
@@ -1523,6 +1539,8 @@ var (
 	user32                = windows.NewLazySystemDLL("user32.dll")
 	sendMessageTimeout    = user32.NewProc("SendMessageTimeoutW")
 	internalGetWindowText = user32.NewProc("InternalGetWindowText")
+	enumMu                sync.Mutex // one EnumWindows at a time (windowsByPID)
+	fitMu                 sync.Mutex // guards Slot.fitted and transparent; one fit at a time
 	windowsByPID          map[uint32][]windows.HWND
 	enumWindowCallback    = windows.NewCallback(func(h windows.HWND, _ uintptr) uintptr {
 		var pid uint32
@@ -1539,8 +1557,8 @@ var (
 // binding, unbinding, config) or that are pending (network changed).
 func watchWindows() {
 	for range time.Tick(time.Second) {
-		windowsByPID = map[uint32][]windows.HWND{}
-		windows.EnumWindows(enumWindowCallback, nil)
+		byPID := visibleWindows()
+		revealStale()
 		adjustSlots()
 		for _, s := range slots {
 			mu.Lock()
@@ -1549,7 +1567,7 @@ func watchWindows() {
 			if !active || cmd == nil || cmd.Process == nil {
 				continue
 			}
-			wins := windowsByPID[uint32(cmd.Process.Pid)]
+			wins := byPID[uint32(cmd.Process.Pid)]
 			for _, h := range wins {
 				if windowTitle(h) != s.window() {
 					setWindowTitle(h, s.window())
@@ -1583,6 +1601,241 @@ func watchWindows() {
 	}
 }
 
+// visibleWindows lists the visible top-level windows by process ID.
+func visibleWindows() map[uint32][]windows.HWND {
+	enumMu.Lock()
+	defer enumMu.Unlock()
+	windowsByPID = map[uint32][]windows.HWND{}
+	windows.EnumWindows(enumWindowCallback, nil)
+	return windowsByPID
+}
+
+// fitSoon fits the slot's windows to a new geometry (rotation) as soon as it has settled, instead
+// of waiting for watchWindows' next tick.
+func fitSoon(s *Slot) {
+	mu.Lock()
+	wait := time.Until(s.geometryAt.Add(time.Second))
+	mu.Unlock()
+	time.AfterFunc(max(wait, 0), func() {
+		mu.Lock()
+		cmd, active := s.cmd, s.active
+		mu.Unlock()
+		if active && cmd != nil && cmd.Process != nil {
+			fitWindows(s, visibleWindows()[uint32(cmd.Process.Pid)], time.Now())
+		}
+	})
+}
+
+var (
+	setWinEventHook  = user32.NewProc("SetWinEventHook")
+	getAncestor      = user32.NewProc("GetAncestor")
+	getDesktopWindow = user32.NewProc("GetDesktopWindow")
+	getMessage       = user32.NewProc("GetMessageW")
+	translateMessage = user32.NewProc("TranslateMessage")
+	dispatchMessage  = user32.NewProc("DispatchMessageW")
+)
+
+const (
+	eventObjectCreate = 0x8000
+	eventObjectShow   = 0x8002
+)
+
+// watchNewWindows hears from Windows as soon as a UxPlay window is created or shown and gives it
+// the "Slot N" title and the video's shape right then (onWindowEvent), so the window isn't seen at
+// the sink's size and resized afterwards. The hook is out of context (no DLL in UxPlay): its events
+// arrive on this thread's message loop. watchWindows stays as the fallback.
+func watchNewWindows() {
+	const wineventOutOfContext, wineventSkipOwnProcess = 0, 2
+	runtime.LockOSThread() // the hook belongs to this thread and its message loop
+	cb := windows.NewCallback(func(_, event, hwnd, idObject, idChild, _, _ uintptr) uintptr {
+		// OBJID_WINDOW and CHILDID_SELF: the window itself, not a part of it
+		if (event == eventObjectCreate || event == eventObjectShow) && int32(idObject) == 0 && int32(idChild) == 0 {
+			onWindowEvent(windows.HWND(hwnd), event == eventObjectShow)
+		}
+		return 0
+	})
+	h, _, err := setWinEventHook.Call(eventObjectCreate, eventObjectShow, 0, cb, 0, 0,
+		wineventOutOfContext|wineventSkipOwnProcess)
+	if h == 0 {
+		logf("window events unavailable: %v; video windows are fitted every second", err)
+		return
+	}
+	var m struct {
+		Hwnd    windows.HWND
+		Message uint32
+		WParam  uintptr
+		LParam  uintptr
+		Time    uint32
+		Pt      [2]int32
+	}
+	for {
+		if r, _, _ := getMessage.Call(uintptr(unsafe.Pointer(&m)), 0, 0, 0); int32(r) <= 0 {
+			return
+		}
+		translateMessage.Call(uintptr(unsafe.Pointer(&m)))
+		dispatchMessage.Call(uintptr(unsafe.Pointer(&m)))
+	}
+}
+
+// onWindowEvent handles a window just created (still hidden) or shown. A top-level window with a
+// title bar of a slot's UxPlay gets the slot's title. The video sink resizes its window to the full
+// video size right before it shows it, which undoes any fit made earlier, and the show event
+// arrives once the window is already on screen. So when the geometry is already known (UxPlay logs
+// it before the window exists), the sink's window is made transparent while it is still hidden,
+// fitted when it is shown, and made opaque once the fit has landed: it is first seen in shape.
+func onWindowEvent(h windows.HWND, shown bool) {
+	const gwlStyle, wsCaption = ^uintptr(15), 0x00C00000 // -16
+	parent, _, _ := getAncestor.Call(uintptr(h), 1)      // GA_PARENT
+	if desk, _, _ := getDesktopWindow.Call(); parent != desk {
+		return
+	}
+	var pid uint32
+	windows.GetWindowThreadProcessId(h, &pid)
+	var s *Slot
+	var video [2]int
+	mu.Lock()
+	for _, o := range slots {
+		if o.active && o.cmd != nil && o.cmd.Process != nil && uint32(o.cmd.Process.Pid) == pid {
+			s, video = o, [2]int{o.width, o.height}
+		}
+	}
+	mu.Unlock()
+	if s == nil {
+		return
+	}
+	if style, _, _ := getWindowLongPtr.Call(uintptr(h), gwlStyle); style&wsCaption == 0 {
+		if shown {
+			revealWindow(h) // went full screen before its show event was handled
+		}
+		return // not a video window, or already full screen
+	}
+	if windowTitle(h) != s.window() {
+		setWindowTitle(h, s.window())
+	}
+	known := video[0] > 0 && video[1] > 0
+	if !shown {
+		if known && windowClass(h) == sinkWindowClass && !windows.IsWindowVisible(h) {
+			hideWindow(h)
+		}
+		return
+	}
+	if !known {
+		revealWindow(h) // fitted when the geometry arrives (fitSoon)
+		return
+	}
+	fitMu.Lock()
+	res, retry, target := fitVideoWindowRect(h, video[0], video[1])
+	if !retry {
+		if s.fitted == nil {
+			s.fitted = map[windows.HWND][2]int{}
+		}
+		s.fitted[h] = video
+	}
+	fitMu.Unlock()
+	if res != "" {
+		logf("slot %d: window %s for video %s", s.N, res, orientation(video[0], video[1]))
+	}
+	go func() {
+		if target != (winRect{}) {
+			waitWindowRect(h, target, 500*time.Millisecond) // the move is asynchronous
+		}
+		revealWindow(h)
+	}()
+}
+
+// sinkWindowClass is d3d11videosink's window class.
+const sinkWindowClass = "GSTD3D11"
+
+const (
+	gwlExStyle  = ^uintptr(19) // -20
+	wsExLayered = 0x00080000
+)
+
+var (
+	getClassName      = user32.NewProc("GetClassNameW")
+	setWindowLongPtr  = user32.NewProc("SetWindowLongPtrW")
+	setLayeredWinAttr = user32.NewProc("SetLayeredWindowAttributes")
+	isWindow          = user32.NewProc("IsWindow")
+	// transparent holds the video windows made transparent at creation, until their fit at show has
+	// landed, and whether revealStale already saw them visible. Guarded by fitMu.
+	transparent = map[windows.HWND]bool{}
+)
+
+func windowClass(h windows.HWND) string {
+	buf := make([]uint16, 64)
+	getClassName.Call(uintptr(h), uintptr(unsafe.Pointer(&buf[0])), uintptr(len(buf)))
+	return windows.UTF16ToString(buf)
+}
+
+func windowExists(h windows.HWND) bool {
+	r, _, _ := isWindow.Call(uintptr(h))
+	return r != 0
+}
+
+// hideWindow makes a not yet visible window fully transparent (layered, alpha 0). The video sink
+// keeps rendering into it; only the screen and captures don't show it until revealWindow. The
+// style change waits for the window's thread, so fitMu is held only for the bookkeeping.
+func hideWindow(h windows.HWND) {
+	const lwaAlpha = 2
+	ex, _, _ := getWindowLongPtr.Call(uintptr(h), gwlExStyle)
+	if ex&wsExLayered != 0 {
+		return // layered by its owner: leave it alone
+	}
+	setWindowLongPtr.Call(uintptr(h), gwlExStyle, ex|wsExLayered)
+	if r, _, _ := setLayeredWinAttr.Call(uintptr(h), 0, 0, lwaAlpha); r == 0 {
+		setWindowLongPtr.Call(uintptr(h), gwlExStyle, ex)
+		return
+	}
+	fitMu.Lock()
+	transparent[h] = false
+	fitMu.Unlock()
+}
+
+// revealWindow undoes hideWindow, if it hid the window.
+func revealWindow(h windows.HWND) {
+	fitMu.Lock()
+	_, ok := transparent[h]
+	delete(transparent, h)
+	fitMu.Unlock()
+	if ok {
+		ex, _, _ := getWindowLongPtr.Call(uintptr(h), gwlExStyle)
+		setWindowLongPtr.Call(uintptr(h), gwlExStyle, ex&^wsExLayered)
+	}
+}
+
+// revealStale reveals the transparent windows that were already visible on the previous call (a
+// show event that never arrived) and forgets the ones that are gone. Called every second.
+func revealStale() {
+	var stale []windows.HWND
+	fitMu.Lock()
+	for h, seen := range transparent {
+		switch {
+		case !windowExists(h):
+			delete(transparent, h)
+		case !windows.IsWindowVisible(h):
+		case seen:
+			stale = append(stale, h)
+		default:
+			transparent[h] = true
+		}
+	}
+	fitMu.Unlock()
+	for _, h := range stale {
+		go revealWindow(h) // the style change waits for the window's thread, which may be hung
+	}
+}
+
+// waitWindowRect waits until the window's rect, in its own DPI context, is r, or the timeout.
+func waitWindowRect(h windows.HWND, r winRect, timeout time.Duration) {
+	defer useWindowDPI(h)()
+	for end := time.Now().Add(timeout); time.Now().Before(end); time.Sleep(2 * time.Millisecond) {
+		var cur winRect
+		if ok, _, _ := getWindowRect.Call(uintptr(h), uintptr(unsafe.Pointer(&cur))); ok == 0 || cur == r {
+			return
+		}
+	}
+}
+
 // windowTitle reads the title without sending a message to the window (won't hang if it's busy).
 func windowTitle(h windows.HWND) string {
 	buf := make([]uint16, 256)
@@ -1603,8 +1856,11 @@ func setWindowTitle(h windows.HWND, t string) {
 // a known geometry and again on each new geometry (rotation), and leaves manual resizes alone in
 // between. UxPlay logs the geometry before the frame is decoded and the video sink may still resize
 // its window to the new caps, so a geometry is only fitted once it is a second old (the sink's own
-// resize is done by then). Only watchWindows calls it.
+// resize is done by then). wins are all the visible windows of the slot's UxPlay. Called by
+// watchWindows and fitSoon; a window that shows up is fitted by onWindowEvent.
 func fitWindows(s *Slot, wins []windows.HWND, now time.Time) {
+	fitMu.Lock()
+	defer fitMu.Unlock()
 	mu.Lock()
 	video := [2]int{s.width, s.height}
 	settling := now.Sub(s.geometryAt) < time.Second
@@ -1624,6 +1880,11 @@ func fitWindows(s *Slot, wins []windows.HWND, now time.Time) {
 		}
 		if res != "" {
 			logf("slot %d: window %s for video %s", s.N, res, orientation(video[0], video[1]))
+		}
+	}
+	for h, done := range s.fitted {
+		if _, ok := seen[h]; !ok && windowExists(h) {
+			seen[h] = done // not in wins yet (shown and fitted after wins was listed)
 		}
 	}
 	s.fitted = seen // windows that are gone are forgotten (a new window is fitted again)
@@ -1681,36 +1942,51 @@ var (
 // whether to try again later (minimized). Maximized or full screen (Alt+Enter) is the user's
 // choice and is left alone.
 func fitVideoWindow(h windows.HWND, vw, vh int) (string, bool) {
+	res, retry, _ := fitVideoWindowRect(h, vw, vh)
+	return res, retry
+}
+
+// useWindowDPI switches the calling thread to the window's DPI awareness context, until the
+// returned function is called. UxPlay's window is DPI unaware, so on a scaled display its
+// borders, its rect, the work area and the move are then all in the same logical units, which are
+// also the units the video sink renders in (the "never larger than the video" cap is in these
+// units too).
+func useWindowDPI(h windows.HWND) func() {
+	runtime.LockOSThread()
+	if getWindowDpiAwarenessContext.Find() == nil && setThreadDpiAwarenessContext.Find() == nil {
+		if ctx, _, _ := getWindowDpiAwarenessContext.Call(uintptr(h)); ctx != 0 {
+			if old, _, _ := setThreadDpiAwarenessContext.Call(ctx); old != 0 {
+				return func() {
+					setThreadDpiAwarenessContext.Call(old)
+					runtime.UnlockOSThread()
+				}
+			}
+		}
+	}
+	return runtime.UnlockOSThread
+}
+
+// fitVideoWindowRect is fitVideoWindow that also gives the rect the window is being moved to, in
+// the window's DPI context (zero if it isn't moved). The move is asynchronous.
+func fitVideoWindowRect(h windows.HWND, vw, vh int) (string, bool, winRect) {
 	const (
-		gwlStyle, gwlExStyle       = ^uintptr(15), ^uintptr(19) // -16, -20
+		gwlStyle                   = ^uintptr(15) // -16
 		wsCaption                  = 0x00C00000
 		monitorDefaultToNearest    = 2
 		swpNoZOrder, swpNoActivate = 0x0004, 0x0010
 		swpAsyncWindowPos          = 0x4000
 	)
 	if r, _, _ := isIconic.Call(uintptr(h)); r != 0 {
-		return "", true
+		return "", true, winRect{}
 	}
 	if r, _, _ := isZoomed.Call(uintptr(h)); r != 0 {
-		return "", false
+		return "", false, winRect{}
 	}
-	// Measure in the window's own DPI context: UxPlay's window is DPI unaware, so on a scaled
-	// display its borders, its rect, the work area and the move are all in the same logical
-	// units, which are also the units the video sink renders in (the "never larger than the
-	// video" cap is in these units too).
-	runtime.LockOSThread()
-	defer runtime.UnlockOSThread()
-	if getWindowDpiAwarenessContext.Find() == nil && setThreadDpiAwarenessContext.Find() == nil {
-		if ctx, _, _ := getWindowDpiAwarenessContext.Call(uintptr(h)); ctx != 0 {
-			if old, _, _ := setThreadDpiAwarenessContext.Call(ctx); old != 0 {
-				defer setThreadDpiAwarenessContext.Call(old)
-			}
-		}
-	}
+	defer useWindowDPI(h)() // measure in the window's own DPI context
 	style, _, _ := getWindowLongPtr.Call(uintptr(h), gwlStyle)
 	ex, _, _ := getWindowLongPtr.Call(uintptr(h), gwlExStyle)
 	if style&wsCaption == 0 {
-		return "", false // full screen
+		return "", false, winRect{} // full screen
 	}
 	var frame winRect // client 0×0 -> window rect: the borders' size
 	dpi := uintptr(0)
@@ -1730,18 +2006,18 @@ func fitVideoWindow(h windows.HWND, vw, vh int) (string, bool) {
 	}{Size: 40}
 	var cur winRect
 	if r, _, _ := getMonitorInfo.Call(mon, uintptr(unsafe.Pointer(&mi))); r == 0 {
-		return "", true
+		return "", true, winRect{}
 	}
 	if r, _, _ := getWindowRect.Call(uintptr(h), uintptr(unsafe.Pointer(&cur))); r == 0 {
-		return "", true
+		return "", true, winRect{}
 	}
 	n := fitWindow(vw, vh, frame.w(), frame.h(), mi.Work, cur)
 	if n == cur {
-		return "", false
+		return "", false, winRect{}
 	}
 	setWindowPos.Call(uintptr(h), 0, uintptr(n.Left), uintptr(n.Top), uintptr(n.w()), uintptr(n.h()),
 		swpNoZOrder|swpNoActivate|swpAsyncWindowPos)
-	return fmt.Sprintf("fitted: client %d×%d", n.w()-frame.w(), n.h()-frame.h()), false
+	return fmt.Sprintf("fitted: client %d×%d", n.w()-frame.w(), n.h()-frame.h()), false, n
 }
 
 // setup extracts the embedded UxPlay (once per version) and creates the firewall rule once.

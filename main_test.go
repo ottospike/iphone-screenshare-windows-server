@@ -24,6 +24,9 @@ const realLine = "connection request from Otavio Augusto’s iPhone (iPhone18,2)
 // Real geometry line from the user's UxPlay 1.74 log.
 const realGeometry = "*** codec is h264: geometry is (w,h)=(498,1080) (source); (x,y)=(711,0); (w,h)=(498,1080)"
 
+// Real H.265 geometry line from an iPhone 17 Pro Max with v0.2.0 (UxPlay 1.74).
+const realGeometryH265 = "*** codec is h265: geometry is (w,h)=(1768,3840) (source); (x,y)=(1036,0); (w,h)=(1768,3840)"
+
 func withConfig(t *testing.T, c Config) {
 	t.Helper()
 	before, brokenBefore, readBefore, unsavedBefore, diskBefore := cfg, configBroken, readFailed, unsaved, diskCfg
@@ -134,7 +137,7 @@ func TestSlotArgs(t *testing.T) {
 		t.Errorf("owner slot: %v", owner)
 	}
 	if !hasSeq(owner, "-n", "LIVE 2") || !hasSeq(owner, "-p", "35020") || !hasSeq(owner, "-vs", "d3d11videosink") ||
-		!hasSeq(owner, "-h265", "-s", "3840x3840", "-fps", "60") {
+		!hasSeq(owner, "-h265", "-s", "2880x2880", "-fps", "60") {
 		t.Errorf("owner slot without name/port/resolution/sink: %v", owner)
 	}
 	if !hasSeq(owner[len(owner)-2:], "-reset", "30") {
@@ -168,7 +171,7 @@ func TestResolutionAndFPSArgs(t *testing.T) {
 		fps  int
 		want []string
 	}{
-		{"native", 60, []string{"-h265", "-s", "3840x3840", "-fps", "60"}},
+		{"native", 60, []string{"-h265", "-s", "2880x2880", "-fps", "60"}},
 		{"fhd", 60, []string{"-s", "1920x1920", "-fps", "60"}},
 		{"hd", 30, []string{"-s", "1280x1280", "-fps", "30"}},
 		{"sd", 30, []string{"-s", "854x854", "-fps", "30"}},
@@ -221,13 +224,16 @@ func TestReConnection(t *testing.T) {
 }
 
 func TestParseGeometry(t *testing.T) {
-	if w, h, ok := parseGeometry(realGeometry); !ok || w != 498 || h != 1080 {
-		t.Fatalf("real line: %d %d %v", w, h, ok)
+	if c, w, h, ok := parseGeometry(realGeometry); !ok || c != "H.264" || w != 498 || h != 1080 {
+		t.Fatalf("real line: %s %d %d %v", c, w, h, ok)
 	}
-	if w, h, ok := parseGeometry("*** codec is h265: geometry is (w,h)=(2868,1320) (source); (w,h)=(1920,884) (displayed)"); !ok || w != 2868 || h != 1320 {
-		t.Fatalf("h265 landscape: %d %d %v", w, h, ok)
+	if c, w, h, ok := parseGeometry(realGeometryH265); !ok || c != "H.265" || w != 1768 || h != 3840 {
+		t.Fatalf("real h265 line: %s %d %d %v", c, w, h, ok)
 	}
-	if _, _, ok := parseGeometry("Begin streaming to GStreamer video pipeline"); ok {
+	if c, w, h, ok := parseGeometry("*** codec is h265: geometry is (w,h)=(2868,1320) (source); (w,h)=(1920,884) (displayed)"); !ok || c != "H.265" || w != 2868 || h != 1320 {
+		t.Fatalf("h265 landscape: %s %d %d %v", c, w, h, ok)
+	}
+	if _, _, _, ok := parseGeometry("Begin streaming to GStreamer video pipeline"); ok {
 		t.Fatalf("matched an unrelated line")
 	}
 	if o := orientation(498, 1080); o != "portrait 498×1080" {
@@ -249,16 +255,48 @@ func TestGeometryInMenuTitleAndRotation(t *testing.T) {
 	s.processLine("Client identified as User-Agent: AirPlay/960.13.1", t0)
 	s.processLine(realGeometry, t0)
 	s.processLine("Begin streaming to GStreamer video pipeline", t0)
-	if got, _ := slotTitle(s); got != "LIVE 2 · Otavio's iPhone · live · portrait 498×1080" {
+	if got, _ := slotTitle(s); got != "LIVE 2 · Otavio's iPhone · live · H.264 · portrait 498×1080" {
 		t.Fatalf("title: %q", got)
 	}
 	msg, _ := s.processLine("*** codec is h264: geometry is (w,h)=(1080,498) (source); (w,h)=(1080,498) (displayed)", t0)
-	if got, _ := slotTitle(s); got != "LIVE 2 · Otavio's iPhone · live · landscape 1080×498" || !strings.Contains(msg, "landscape") {
+	if got, _ := slotTitle(s); got != "LIVE 2 · Otavio's iPhone · live · H.264 · landscape 1080×498" || !strings.Contains(msg, "landscape") {
 		t.Fatalf("rotation: %q %q", got, msg)
 	}
 	s.processLine("raop_rtp_mirror->running is no longer true", t0)
 	if got, _ := slotTitle(s); strings.Contains(got, "landscape") {
 		t.Fatalf("geometry shown after mirroring stopped: %q", got)
+	}
+}
+
+// The codec comes from the geometry line: shown in the menu while live and logged with the size.
+func TestCodecInMenuTitleAndLog(t *testing.T) {
+	withConfig(t, testConfig(map[string]Binding{"2": {DeviceID: "22:C5:83:7E:F0:3F", Device: "Otavio's iPhone"}}))
+	s := &Slot{N: 2, restartCh: make(chan struct{}, 1)}
+	t0 := time.Now()
+	s.processLine(realLine, t0)
+	s.processLine("raop_rtp_mirror starting mirroring", t0)
+	msg, _ := s.processLine(realGeometryH265, t0)
+	if msg != "slot 2: video H.265 portrait 1768×3840" {
+		t.Fatalf("log: %q", msg)
+	}
+	if got, _ := slotTitle(s); strings.Contains(got, "H.265") {
+		t.Fatalf("codec shown before the video started: %q", got)
+	}
+	s.processLine("Begin streaming to GStreamer video pipeline", t0)
+	if got, _ := slotTitle(s); got != "LIVE 2 · Otavio's iPhone · live · H.265 · portrait 1768×3840" {
+		t.Fatalf("title: %q", got)
+	}
+	if msg, _ := s.processLine(realGeometryH265, t0); msg != "" {
+		t.Errorf("same geometry logged again: %q", msg)
+	}
+	s.processLine("raop_rtp_mirror->running is no longer true", t0)
+	if got, _ := slotTitle(s); strings.Contains(got, "H.265") {
+		t.Fatalf("codec shown after mirroring stopped: %q", got)
+	}
+	s.processLine(realLine, t0)
+	s.processLine("Client identified as User-Agent: AirPlay/960.13.1", t0)
+	if s.codec != "" || s.width != 0 {
+		t.Errorf("new session kept the old codec/size: %q %d", s.codec, s.width)
 	}
 }
 

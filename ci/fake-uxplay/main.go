@@ -5,6 +5,9 @@
 //   - on the free slot "LIVE 1" it simulates a device that connects, is accepted and starts
 //     mirroring, with the window showing up only a few seconds after the accept (the case where
 //     the slot was restarted before the window existed), then rotates to landscape;
+//   - creates its window like d3d11videosink: hidden, then on the "first frame" sized to the full
+//     video at (0,0) and shown; it prints the client size it has the first time it is seen, visible
+//     and not transparent ("FAKE: seen client WxH"): the app must have fitted it by then;
 //   - prints its client size on every resize ("FAKE: client WxH"), so CI sees the app fit the
 //     window to the portrait video and then to the landscape one;
 //   - the other slots just stay up, like UxPlay waiting for a device.
@@ -27,6 +30,13 @@ var (
 	registerClass    = user32.NewProc("RegisterClassExW")
 	createWindow     = user32.NewProc("CreateWindowExW")
 	showWindow       = user32.NewProc("ShowWindow")
+	getClientRect    = user32.NewProc("GetClientRect")
+	setTimer         = user32.NewProc("SetTimer")
+	killTimer        = user32.NewProc("KillTimer")
+	moveWindow       = user32.NewProc("MoveWindow")
+	adjustWindowRect = user32.NewProc("AdjustWindowRect")
+	getWindowLongPtr = user32.NewProc("GetWindowLongPtrW")
+	getLayeredAttr   = user32.NewProc("GetLayeredWindowAttributes")
 	defWindowProc    = user32.NewProc("DefWindowProcW")
 	getMessage       = user32.NewProc("GetMessageW")
 	translateMessage = user32.NewProc("TranslateMessage")
@@ -89,22 +99,70 @@ func main() {
 	time.Sleep(4 * time.Second) // video is slow: no window yet
 	fmt.Println("*** codec is h264: geometry is (w,h)=(1320,2868) (source); (w,h)=(1320,2868) (displayed)")
 	fmt.Println("Begin streaming to GStreamer video pipeline")
+	time.Sleep(500 * time.Millisecond) // the sink creates its window after the geometry line
 	go func() {
-		time.Sleep(5 * time.Second) // the app fits the window to portrait first
+		time.Sleep(6 * time.Second) // the app fits the window to portrait first
 		fmt.Println("*** codec is h264: geometry is (w,h)=(2868,1320) (source); (w,h)=(2868,1320) (displayed)")
 	}()
-	openWindow(name)
+	openWindow(name, 1320, 2868)
 }
 
-// openWindow creates the video window the way the sink does (normal ShowWindow) and runs the
-// message loop.
-func openWindow(title string) {
+// openWindow creates the video window the way d3d11videosink does: hidden, with its class name and
+// no size; 700 ms later, as the sink does with its first frame, it sizes the window to the full
+// video at (0,0) and shows it. It prints the client size the window has the first time it is seen,
+// visible and not transparent ("FAKE: seen client WxH"), and runs the message loop.
+func openWindow(title string, vw, vh int32) {
+	const (
+		wsOverlappedWindow, cwUseDefault         = 0x00CF0000, 0x80000000
+		wmSize, wmShowWindow, wmStyleChanged     = 0x0005, 0x0018, 0x007D
+		wmTimer, swShow, gwlExStyle, wsExLayered = 0x0113, 5, ^uintptr(19), 0x00080000
+		lwaAlpha                                 = 2
+	)
 	runtime.LockOSThread()
-	class, _ := windows.UTF16PtrFromString("FakeUxPlay")
+	class, _ := windows.UTF16PtrFromString("GSTD3D11")
 	t, _ := windows.UTF16PtrFromString(title)
+	shown, seen := false, false
+	report := func(h windows.HWND) {
+		if !shown || seen {
+			return
+		}
+		if ex, _, _ := getWindowLongPtr.Call(uintptr(h), gwlExStyle); ex&wsExLayered != 0 {
+			var alpha byte
+			var flags uint32
+			r, _, _ := getLayeredAttr.Call(uintptr(h), 0, uintptr(unsafe.Pointer(&alpha)), uintptr(unsafe.Pointer(&flags)))
+			if r != 0 && flags&lwaAlpha != 0 && alpha == 0 {
+				return // transparent: not seen
+			}
+		}
+		seen = true
+		var r [4]int32
+		getClientRect.Call(uintptr(h), uintptr(unsafe.Pointer(&r)))
+		fmt.Printf("FAKE: seen client %dx%d\n", r[2]-r[0], r[3]-r[1])
+	}
 	proc := windows.NewCallback(func(h windows.HWND, m uint32, w, l uintptr) uintptr {
-		if m == 0x0005 { // WM_SIZE: client width and height in lParam
+		switch m {
+		case wmSize: // client width and height in lParam
 			fmt.Printf("FAKE: client %dx%d\n", l&0xFFFF, (l>>16)&0xFFFF)
+			report(h)
+		case wmShowWindow: // sent right before the window becomes visible
+			if w != 0 {
+				shown = true
+				report(h)
+			}
+		case wmStyleChanged:
+			report(h)
+		case wmTimer: // first frame: size to the video, then show, like the sink
+			killTimer.Call(uintptr(h), w)
+			r := [4]int32{0, 0, vw, vh}
+			adjustWindowRect.Call(uintptr(unsafe.Pointer(&r)), wsOverlappedWindow, 0)
+			moveWindow.Call(uintptr(h), 0, 0, uintptr(r[2]-r[0]), uintptr(r[3]-r[1]), 0)
+			showWindow.Call(uintptr(h), swShow)
+			v := 0
+			if windows.IsWindowVisible(h) {
+				v = 1
+			}
+			fmt.Printf("FAKE: visible=%d\n", v)
+			return 0
 		}
 		r, _, _ := defWindowProc.Call(uintptr(h), uintptr(m), w, l)
 		return r
@@ -112,19 +170,13 @@ func openWindow(title string) {
 	wc := wndClassEx{WndProc: proc, ClassName: class}
 	wc.Size = uint32(unsafe.Sizeof(wc))
 	registerClass.Call(uintptr(unsafe.Pointer(&wc)))
-	const wsOverlappedWindow, cwUseDefault, swShowNormal = 0x00CF0000, 0x80000000, 1
 	h, _, err := createWindow.Call(0, uintptr(unsafe.Pointer(class)), uintptr(unsafe.Pointer(t)), wsOverlappedWindow,
-		cwUseDefault, cwUseDefault, 640, 360, 0, 0, 0, 0)
+		cwUseDefault, cwUseDefault, 0, 0, 0, 0, 0, 0)
 	if h == 0 {
 		fmt.Println("FAKE: CreateWindowEx failed:", err)
 		os.Exit(4)
 	}
-	showWindow.Call(h, swShowNormal)
-	v := 0
-	if windows.IsWindowVisible(windows.HWND(h)) {
-		v = 1
-	}
-	fmt.Printf("FAKE: visible=%d\n", v)
+	setTimer.Call(h, 1, 700, 0)
 	var m msg
 	for {
 		r, _, _ := getMessage.Call(uintptr(unsafe.Pointer(&m)), 0, 0, 0)

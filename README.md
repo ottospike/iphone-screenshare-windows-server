@@ -76,8 +76,11 @@ The video window:
   from Screen Mirroring.
 - The app fits the window to the video, so there are no black bars: its client area takes the
   video's aspect ratio, as large as fits in 90% of its monitor's work area (the screen minus the
-  taskbar) but never larger than the video. You can resize it by hand; the app fits it again when
-  it shows up, on every rotation and when a device reconnects.
+  taskbar) but never larger than the video. The window is first seen already in that shape: UxPlay
+  sizes its new window to the full video right before showing it, so the app keeps the window
+  transparent from the moment it is created until it has been fitted, a few milliseconds after it
+  is shown. You can resize it by hand; the app fits it again on every rotation and when a device
+  reconnects.
 - Quality comes from what the device sends (**Native**: its own resolution). The window only
   needs to show the whole video, and it may be smaller than the video: OBS captures the whole
   picture, at the window's size.
@@ -99,7 +102,7 @@ separate audio app that OBS can capture:
 | Item | What it does |
 |---|---|
 | First line | How many slots are bound, or that all are bound; with `maxSlots` 1, `Single LIVE · any device` |
-| `LIVE 2 · <device> · <state> · portrait 1320×2868` | One per running slot: bound device or `free`, state, and while live the orientation and real source resolution, updated on every rotation. Submenu: **Unbind this slot** |
+| `LIVE 2 · <device> · <state> · H.265 · portrait 1320×2868` | One per running slot: bound device or `free`, state, and while live the codec, H.264 or H.265, the orientation and the real source resolution, updated on every rotation. Submenu: **Unbind this slot** |
 | **Resolution** | Native · FHD · HD · SD, for all slots. Saved; each slot's UxPlay restarts with it once nobody is mirroring on it, so live devices are not dropped |
 | **FPS** | 60 · 30, for all slots. Saved; applied the same way |
 | **Restart** | Rereads the config and restarts every slot. If the config has an error or can't be read, nothing restarts and live devices stay connected |
@@ -122,9 +125,14 @@ AirPlay requires the receiver to declare a display size; the sender scales its s
 inside it. A 16:9 size would shrink a portrait phone to a fraction of its pixels, so the app asks
 for a **square**: portrait and landscape devices both fit at full size.
 
+The sender also scales **up** to fill the declared size, so Native asks for 2880×2880 and not more:
+with 3840×3840 an iPhone 17 Pro Max, natively 1320×2868, sent 1768×3840, upscaled by the phone and
+heavier on the network with no extra detail. 2880 is about the native height of a recent iPhone,
+so it sends roughly its own resolution, and it still fits an iPad Pro's 2752 at full size.
+
 | Option | UxPlay flags | When |
 |---|---|---|
-| **Native** (default) | `-h265 -s 3840x3840` | The device sends its native resolution, e.g. 1320×2868 on a recent iPhone, in H.265. Best quality; needs a good 5 GHz network |
+| **Native** (default) | `-h265 -s 2880x2880` | The device sends about its native resolution, e.g. about 1325×2880 on an iPhone 17 Pro Max, in H.265. Best quality; needs a good 5 GHz network |
 | **FHD** | `-s 1920x1920` | H.264, longest side up to 1920. Less bandwidth and CPU |
 | **HD** | `-s 1280x1280` | H.264, longest side up to 1280. Weak Wi-Fi or many devices at once |
 | **SD** | `-s 854x854` | H.264, longest side up to 854. Very weak Wi-Fi, last resort |
@@ -132,7 +140,7 @@ for a **square**: portrait and landscape devices both fit at full size.
 **FPS** sets the maximum frame rate (`-fps 60` or `-fps 30`). 30 lowers bandwidth and CPU.
 A change applies to each slot as soon as nobody is mirroring on it: a live device keeps its current
 settings until it stops mirroring, or use **Restart** to apply it everywhere now.
-The actual source size of each slot is shown in the tray menu.
+The codec and the actual source size of each slot are shown in the tray menu and in the log.
 
 ## When the connection drops
 
@@ -225,14 +233,15 @@ iPhoneScreenshareServer.exe (Go, tray)
  ├─ embedded bundle/uxplay.zip ── extracted once ──> %LOCALAPPDATA%\iPhoneScreenshareServer\uxplay-<hash>\
  │                                                    bin\uxplay.exe + DLLs, GStreamer plugins
  ├─ per slot: uxplay.exe -n "LIVE N" -nh -p <slot ports> -m <slot MAC> -vs d3d11videosink
- │            -h265 -s 3840x3840 -fps 60   (Resolution/FPS from the tray)
+ │            -h265 -s 2880x2880 -fps 60   (Resolution/FPS from the tray)
  │            + bound: -restrict -allow <deviceID> -nohold; other slots: -block <deviceID>
  ├─ dynamic slots: one running per bound device plus one free, up to maxSlots
  ├─ reads UxPlay output: "connection request from <device> ... deviceID = <id>" and the accept → binds the slot;
  │                       "Begin streaming" / session end → live / stopped;
- │                       "codec is h264|h265: geometry is (w,h)=(…) (source)" → orientation and size
+ │                       "codec is h264|h265: geometry is (w,h)=(…) (source)" → codec, orientation and size
  ├─ renames each UxPlay video window to "Slot N" (OBS finds the source by title)
- ├─ fits each video window to the video (no black bars) when it shows up, on rotation and on reconnect
+ ├─ window events: each new video window stays transparent until it is fitted to the video
+ │                 (no black bars) at show, so it is first seen in shape; fitted again on rotation
  ├─ watches the process: crashed → restart; 3 quick crashes → stop and warn
  ├─ watches the network: IP changed or PC resumed → restarts idle slots
  └─ Windows job object: however the app exits, uxplay exits with it
@@ -244,8 +253,9 @@ patch: unbuffered output, so the app sees at once which device connected. CI run
 tests (`main_test.go`) and tests the result on a clean Windows: all GStreamer elements present,
 `uxplay.exe` starting with each resolution preset, `iPhoneScreenshareServer.exe` extracting and
 keeping the free slot up, and, with a fake uxplay (`ci/fake-uxplay`) that simulates a device, the
-binding, the new slot, distinct MACs, the geometry and rotation, a visible `Slot 1` window, and
-that window fitted to the portrait video and then to the landscape one.
+binding, the new slot, distinct MACs, the codec, geometry and rotation, a visible `Slot 1` window
+that, sized to the full video and then shown like the real video sink does, is first seen already
+in the portrait video's shape, and that window fitted to the landscape one after the rotation.
 
 The app sends no data anywhere. It only talks to devices on the local network over AirPlay.
 
