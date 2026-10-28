@@ -13,6 +13,9 @@ permissions:
 env:
   # Commit do FDH2/UxPlay com o mDNS embutido (>= 1.74, ainda sem release). Trocar para atualizar.
   UXPLAY_REF: 28ed70a9876fe3f5864479f4e0d07abe4678383a
+  # Release do Genymobile/scrcpy (Android) e o SHA-256 do scrcpy-win64 dela (SHA256SUMS.txt da release).
+  SCRCPY_VERSION: 5.0.1
+  SCRCPY_SHA256: b12a2c4ee8be317422451fc7dcf8ee20a71b5ea7ef9ad73ddd825a25316227a5
 
 jobs:
   windows:
@@ -25,7 +28,7 @@ jobs:
           msystem: UCRT64
           update: true
           install: >-
-            git zip
+            git zip unzip curl
             mingw-w64-ucrt-x86_64-gcc
             mingw-w64-ucrt-x86_64-cmake
             mingw-w64-ucrt-x86_64-ninja
@@ -42,24 +45,28 @@ jobs:
         shell: msys2 {0}
         run: bash ci/montar-bundle.sh
 
+      - name: Baixar scrcpy e montar bundle
+        shell: msys2 {0}
+        run: bash ci/baixar-scrcpy.sh
+
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
 
-      - name: Compilar iPhoneScreenshareServer.exe
-        run: go build -ldflags "-H windowsgui -s -w" -o dist/iPhoneScreenshareServer.exe .
+      - name: Compilar PhoneScreenshareServer.exe
+        run: go build -ldflags "-H windowsgui -s -w" -o dist/PhoneScreenshareServer.exe .
 
       - name: Teste de fumaca
         run: ./ci/testar.ps1
 
       - uses: actions/upload-artifact@v4
         with:
-          name: iPhoneScreenshareServer
-          path: dist/iPhoneScreenshareServer.exe
+          name: PhoneScreenshareServer
+          path: dist/PhoneScreenshareServer.exe
 
       - name: Publicar release
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/iPhoneScreenshareServer.exe
+          files: dist/PhoneScreenshareServer.exe
           generate_release_notes: true

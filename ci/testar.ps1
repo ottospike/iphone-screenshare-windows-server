@@ -1,7 +1,8 @@
 # Teste de fumaca no Windows do CI, fora do MSYS2 (PATH limpo, como no PC de quem usa):
 # 1) o bundle acha todos os elementos do GStreamer que o UxPlay usa;
 # 2) o uxplay.exe sobe e continua no ar;
-# 3) o iPhoneScreenshareServer.exe extrai o bundle sozinho e mantem um uxplay por slot (2 por padrao).
+# 3) o PhoneScreenshareServer.exe extrai os bundles sozinho e mantem um uxplay por slot (2 por padrao);
+# 4) o scrcpy extraido roda e o servidor do adb sobe (sem Android no CI nao da para espelhar).
 $ErrorActionPreference = 'Stop'
 $b = Resolve-Path 'build/uxplay'
 $env:PATH = "$b\bin;C:\Windows\System32;C:\Windows"
@@ -39,10 +40,18 @@ try { Espera-UxPlay 15 } finally {
 
 Remove-Item Env:GST_*, Env:FONTCONFIG_FILE
 $env:PATH = 'C:\Windows\System32;C:\Windows'
-$app = Start-Process 'dist/iPhoneScreenshareServer.exe' -PassThru
-try { Espera-UxPlay 40 2 } finally {
-  Get-Content "$env:LOCALAPPDATA\iPhoneScreenshareServer\espelho.log" -ErrorAction SilentlyContinue | Select-Object -Last 40
+$app = Start-Process 'dist/PhoneScreenshareServer.exe' -PassThru
+try {
+  Espera-UxPlay 40 2
+  $scrcpy = Get-ChildItem "$env:LOCALAPPDATA\PhoneScreenshareServer\scrcpy-*\scrcpy.exe" | Select-Object -First 1
+  if (-not $scrcpy) { throw 'scrcpy.exe nao foi extraido' }
+  & $scrcpy.FullName --version
+  if ($LASTEXITCODE -ne 0) { throw "scrcpy --version saiu com $LASTEXITCODE" }
+  if (-not (Get-Process adb -ErrorAction SilentlyContinue)) { throw 'servidor do adb nao subiu' }
+  Write-Host 'scrcpy e adb OK'
+} finally {
+  Get-Content "$env:LOCALAPPDATA\PhoneScreenshareServer\espelho.log" -ErrorAction SilentlyContinue | Select-Object -Last 40
   Stop-Process -Id $app.Id -Force -ErrorAction SilentlyContinue
-  Get-Process uxplay -ErrorAction SilentlyContinue | Stop-Process -Force
+  Get-Process uxplay, adb -ErrorAction SilentlyContinue | Stop-Process -Force
 }
 Write-Host 'OK'

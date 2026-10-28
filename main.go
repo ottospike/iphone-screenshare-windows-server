@@ -1,8 +1,10 @@
-// iPhone Screenshare Windows Server: icone na bandeja do Windows que mantem o UxPlay (receptor AirPlay) rodando
-// para o OBS capturar a janela. O UxPlay e o GStreamer vao embutidos neste .exe (bundle/uxplay.zip,
-// gerado pelo CI) e sao extraidos na primeira execucao. Escolhe FHD/HD, reinicia o UxPlay se ele
-// cair e para de tentar se ele cair em loop (flag errada, porta ocupada), mostrando o log.
-// Com 2+ slots, cada iPhone fica preso ao seu slot (janela "Slot N" no OBS) e volta para ele.
+// Phone Screenshare Server: icone na bandeja do Windows que mantem o UxPlay (receptor AirPlay, iPhone) e
+// o scrcpy (Android) rodando para o OBS capturar as janelas. UxPlay+GStreamer e scrcpy+adb vao embutidos
+// neste .exe (bundle/uxplay.zip e bundle/scrcpy.zip, gerados pelo CI) e sao extraidos na primeira
+// execucao. Escolhe FHD/HD, reinicia o UxPlay se ele cair e para de tentar se ele cair em loop (flag
+// errada, porta ocupada), mostrando o log.
+// Com 2+ slots, cada iPhone fica preso ao seu slot (janela "Slot N" no OBS) e volta para ele; cada
+// Android, ao seu (janela "Android N"; ver android.go).
 package main
 
 import (
@@ -36,10 +38,16 @@ import (
 	"golang.org/x/sys/windows"
 )
 
-const regraFirewall = "iPhone Screenshare Windows Server"
+const (
+	regraFirewall = "Phone Screenshare Server"
+	regraAntiga   = "iPhone Screenshare Windows Server" // nome do app ate a versao so-iPhone
+)
 
 //go:embed bundle/uxplay.zip
-var bundleZip []byte
+var bundleUxPlay []byte
+
+//go:embed bundle/scrcpy.zip
+var bundleScrcpy []byte
 
 type Vinculo struct {
 	DeviceID string `json:"deviceID"` // deviceID que o iPhone manda no AirPlay (o UxPlay loga)
@@ -48,11 +56,15 @@ type Vinculo struct {
 
 type Config struct {
 	Nome       string             `json:"nome"`       // nome no "Espelhar Tela"; com 2+ slots vira "LIVE 1", "LIVE 2"...
-	Slots      int                `json:"slots"`      // quantos iPhones ao mesmo tempo (1 a 4)
+	Slots      int                `json:"slots"`      // quantos iPhones ao mesmo tempo (0 a 4)
 	Qualidade  string             `json:"qualidade"`  // "FHD" ou "HD"
 	UxPlay     string             `json:"uxplay"`     // caminho de outro uxplay.exe; vazio = o embutido
 	ArgsExtras []string           `json:"argsExtras"` // ex.: ["-reset", "30"]
 	Vinculos   map[string]Vinculo `json:"vinculos"`   // "1" -> iPhone preso ao slot 1
+
+	Android         int                       `json:"android"`         // quantos Androids ao mesmo tempo (0 a 4)
+	ArgsScrcpy      []string                  `json:"argsScrcpy"`      // ex.: ["--no-audio"]
+	VinculosAndroid map[string]VinculoAndroid `json:"vinculosAndroid"` // "1" -> Android preso ao slot Android 1
 }
 
 var qualidades = map[string][]string{
@@ -69,15 +81,16 @@ var (
 )
 
 var (
-	dirApp  = filepath.Join(os.Getenv("LOCALAPPDATA"), "iPhoneScreenshareServer")
-	arqCfg  = filepath.Join(dirApp, "config.json")
-	arqLog  = filepath.Join(dirApp, "espelho.log")
-	cfg     = Config{Nome: "LIVE", Slots: 2, Qualidade: "FHD"}
-	mu      sync.Mutex // protege cfg, parado e os campos dos slots
-	parado  bool       // true quando o usuario pediu para sair
-	slots   []*Slot
-	job     windows.Handle
-	logFile *os.File
+	dirApp    = filepath.Join(os.Getenv("LOCALAPPDATA"), "PhoneScreenshareServer")
+	dirAntigo = filepath.Join(os.Getenv("LOCALAPPDATA"), "iPhoneScreenshareServer") // config da versao so-iPhone
+	arqCfg    = filepath.Join(dirApp, "config.json")
+	arqLog    = filepath.Join(dirApp, "espelho.log")
+	cfg       = Config{Nome: "LIVE", Slots: 2, Qualidade: "FHD", Android: 2}
+	mu        sync.Mutex // protege cfg, parado e os campos dos slots
+	parado    bool       // true quando o usuario pediu para sair
+	slots     []*Slot
+	job       windows.Handle
+	logFile   *os.File
 )
 
 // Slot e um UxPlay proprio (nome, portas e janela "Slot N" no OBS). O primeiro iPhone que conecta
@@ -108,9 +121,13 @@ func (s *Slot) nome() string {
 func (s *Slot) titulo() string { return fmt.Sprintf("Slot %d", s.N) }
 
 func main() {
-	// Duas copias abertas brigariam pelos mesmos nomes e portas e cairiam em loop.
+	// Duas copias abertas (ou esta e a versao antiga so-iPhone) brigariam pelos mesmos nomes e portas.
+	if _, err := windows.CreateMutex(nil, false, ptr(`Local\PhoneScreenshareServer`)); err == windows.ERROR_ALREADY_EXISTS {
+		aviso("O Phone Screenshare Server ja esta aberto (icone na bandeja, perto do relogio).")
+		return
+	}
 	if _, err := windows.CreateMutex(nil, false, ptr(`Local\iPhoneScreenshareServer`)); err == windows.ERROR_ALREADY_EXISTS {
-		aviso("O iPhone Screenshare Windows Server ja esta aberto (icone na bandeja, perto do relogio).")
+		aviso("O iPhone Screenshare antigo esta aberto. Feche ele (bandeja > Sair) e abra este de novo.")
 		return
 	}
 	os.MkdirAll(dirApp, 0o755)
@@ -118,6 +135,12 @@ func main() {
 		os.Rename(arqLog, arqLog+".old")
 	}
 	logFile, _ = os.OpenFile(arqLog, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+	if _, err := os.Stat(arqCfg); err != nil {
+		if b, err := os.ReadFile(filepath.Join(dirAntigo, "config.json")); err == nil {
+			os.WriteFile(arqCfg, b, 0o644)
+			logf("config migrada de %s", dirAntigo)
+		}
+	}
 	carregarConfig()
 	systray.Run(aoAbrir, aoSair)
 }
@@ -133,9 +156,13 @@ func carregarConfig() {
 	if _, ok := qualidades[cfg.Qualidade]; !ok {
 		cfg.Qualidade = "FHD"
 	}
-	cfg.Slots = min(max(cfg.Slots, 1), 4)
+	cfg.Slots = min(max(cfg.Slots, 0), 4)
+	cfg.Android = min(max(cfg.Android, 0), 4)
 	if cfg.Vinculos == nil {
 		cfg.Vinculos = map[string]Vinculo{}
+	}
+	if cfg.VinculosAndroid == nil {
+		cfg.VinculosAndroid = map[string]VinculoAndroid{}
 	}
 	salvarConfig()
 }
@@ -144,15 +171,18 @@ func carregarConfig() {
 // (o menu e montado na abertura).
 func recarregarConfig() {
 	mu.Lock()
-	n := cfg.Slots
-	cfg.Vinculos = nil
+	n, na := cfg.Slots, cfg.Android
+	cfg.Vinculos, cfg.VinculosAndroid = nil, nil
 	carregarConfig()
-	cfg.Slots = n
+	cfg.Slots, cfg.Android = n, na
 	salvarConfig()
 	mu.Unlock()
 	logf("config relida")
 	for _, s := range slots {
 		atualizarMenu(s)
+	}
+	for _, s := range slotsAndroid {
+		atualizarMenuAndroid(s)
 	}
 }
 
@@ -164,7 +194,7 @@ func salvarConfig() {
 
 func aoAbrir() {
 	systray.SetIcon(icone(cor["cinza"]))
-	systray.SetTooltip("iPhone Screenshare")
+	systray.SetTooltip("Phone Screenshare")
 
 	mStatus := systray.AddMenuItem("Preparando (1a vez demora uns segundos)...", "")
 	mStatus.Disable()
@@ -175,6 +205,18 @@ func aoAbrir() {
 		s.desv = s.item.AddSubMenuItem("Desvincular iPhone deste slot", "o proximo iPhone que conectar fica com ele")
 		slots = append(slots, s)
 		atualizarMenu(s)
+	}
+	var mParear *systray.MenuItem
+	if cfg.Android > 0 {
+		systray.AddSeparator()
+		for n := 1; n <= cfg.Android; n++ {
+			s := &SlotAndroid{N: n, estado: "iniciando", cor: "cinza"}
+			s.item = systray.AddMenuItem("", "")
+			s.desv = s.item.AddSubMenuItem("Desvincular Android deste slot", "o proximo Android que conectar fica com ele")
+			slotsAndroid = append(slotsAndroid, s)
+			atualizarMenuAndroid(s)
+		}
+		mParear = systray.AddMenuItem("Parear Android pelo Wi-Fi (QR code)", "uma vez por celular; depois ele conecta sozinho")
 	}
 	systray.AddSeparator()
 	mFHD := systray.AddMenuItemCheckbox("FHD 1080p", "1920x1080 a 60 fps", cfg.Qualidade == "FHD")
@@ -193,7 +235,7 @@ func aoAbrir() {
 		systray.SetIcon(icone(cor["vermelho"]))
 		aviso(err.Error())
 	} else {
-		mStatus.SetTitle(fmt.Sprintf("Qualidade %s, %d slot(s)", cfg.Qualidade, cfg.Slots))
+		mStatus.SetTitle(linhaStatus())
 		for _, s := range slots {
 			go supervisionar(s, exe)
 			go func(s *Slot) {
@@ -202,11 +244,27 @@ func aoAbrir() {
 				}
 			}(s)
 		}
+		for _, s := range slotsAndroid {
+			setEstadoAndroid(s, "esperando o Android", "verde")
+			go func(s *SlotAndroid) {
+				for range s.desv.ClickedCh {
+					desvincularAndroid(s)
+				}
+			}(s)
+		}
+		if mParear != nil {
+			go vigiarAndroid()
+			go func() {
+				for range mParear.ClickedCh {
+					go parearQR()
+				}
+			}()
+		}
 		go vigiarRede()
 		go vigiarJanelas()
 		if redePublica() {
 			logf("aviso: rede do Windows marcada como Publica")
-			aviso("A rede do Windows esta como PUBLICA: o firewall pode bloquear o iPhone.\n" +
+			aviso("A rede do Windows esta como PUBLICA: o firewall pode bloquear o celular.\n" +
 				"Configuracoes > Rede e Internet > (sua rede) > Propriedades > Rede privada.")
 		}
 	}
@@ -240,7 +298,15 @@ func aoSair() {
 			s.cmd.Process.Kill()
 		}
 	}
+	for _, s := range slotsAndroid {
+		if s.cmd != nil && s.cmd.Process != nil {
+			s.cmd.Process.Kill()
+		}
+	}
 	mu.Unlock()
+	if adbExe != "" {
+		oculto(adbExe, "kill-server").Run()
+	}
 	logf("app encerrado")
 }
 
@@ -256,20 +322,35 @@ func atualizarMenu(s *Slot) {
 		s.desv.Disable()
 	}
 	s.item.SetTitle(fmt.Sprintf("%s \"%s\": %s, %s", s.titulo(), s.nome(), quem, s.estado))
+	atualizarIcone()
+}
 
-	pior := "verde"
+// atualizarIcone pinta o icone com a pior cor entre os slots de iPhone e de Android; chamar com mu travado.
+func atualizarIcone() {
+	cores := []string{}
 	for _, o := range slots {
+		cores = append(cores, o.cor)
+	}
+	for _, o := range slotsAndroid {
+		cores = append(cores, o.cor)
+	}
+	pior := "verde"
+	for _, c := range cores {
 		switch {
-		case o.cor == "vermelho":
+		case c == "vermelho":
 			pior = "vermelho"
-		case o.cor == "amarelo" && pior != "vermelho":
+		case c == "amarelo" && pior != "vermelho":
 			pior = "amarelo"
-		case o.cor == "cinza" && pior == "verde":
+		case c == "cinza" && pior == "verde":
 			pior = "cinza"
 		}
 	}
 	systray.SetIcon(icone(cor[pior]))
-	systray.SetTooltip("iPhone Screenshare: " + pior)
+	systray.SetTooltip("Phone Screenshare: " + pior)
+}
+
+func linhaStatus() string {
+	return fmt.Sprintf("Qualidade %s, %d iPhone(s), %d Android(s)", cfg.Qualidade, cfg.Slots, cfg.Android)
 }
 
 func setEstado(s *Slot, estado, c string) {
@@ -296,7 +377,7 @@ func trocarQualidade(q string, mFHD, mHD, mStatus *systray.MenuItem) {
 		return
 	}
 	logf("qualidade -> %s", q)
-	mStatus.SetTitle(fmt.Sprintf("Qualidade %s, %d slot(s)", q, cfg.Slots))
+	mStatus.SetTitle(linhaStatus())
 	reiniciarTodos()
 }
 
@@ -330,6 +411,7 @@ func reiniciarTodos() {
 	for _, s := range slots {
 		pedirReinicio(s)
 	}
+	reiniciarAndroids()
 }
 
 // argsSlot monta a linha do UxPlay do slot com a config atual; chamar com mu travado.
@@ -520,11 +602,14 @@ func tituloJanela(h windows.HWND) string {
 	return windows.UTF16ToString(buf)
 }
 
-// prepararAmbiente extrai o UxPlay embutido (uma vez por versao) e cria a regra de firewall uma vez.
+// prepararAmbiente extrai o UxPlay e o scrcpy embutidos (uma vez por versao) e cria as regras de
+// firewall uma vez. Devolve o uxplay.exe ("" sem slots de iPhone).
 func prepararAmbiente() (string, error) {
 	exe := cfg.UxPlay
-	if exe == "" {
-		dir, err := extrairBundle()
+	if cfg.Slots == 0 {
+		exe = ""
+	} else if exe == "" {
+		dir, err := extrairBundle("uxplay", bundleUxPlay)
 		if err != nil {
 			return "", fmt.Errorf("Nao consegui extrair o UxPlay embutido: %v", err)
 		}
@@ -540,13 +625,28 @@ func prepararAmbiente() (string, error) {
 		return "", fmt.Errorf("O \"uxplay\" do config nao existe: %s\nApague a linha para usar o embutido.\nConfig: %s", exe, arqCfg)
 	}
 	logf("uxplay: %s", exe)
+	if cfg.Android > 0 {
+		if err := prepararAndroid(); err != nil {
+			return "", err
+		}
+	}
 
-	regra, _ := oculto("netsh", "advfirewall", "firewall", "show", "rule", "name="+regraFirewall, "verbose").CombinedOutput()
-	if !strings.Contains(strings.ToLower(string(regra)), strings.ToLower(exe)) {
-		logf("criando/atualizando regra de firewall (pede admin)")
-		params := fmt.Sprintf(`/c netsh advfirewall firewall delete rule name="%[1]s" & `+
-			`netsh advfirewall firewall add rule name="%[1]s" dir=in action=allow program="%[2]s" profile=private,domain`, regraFirewall, exe)
-		windows.ShellExecute(0, ptr("runas"), ptr("cmd"), ptr(params), nil, windows.SW_HIDE)
+	// UxPlay recebe o AirPlay; o adb recebe o mDNS da Depuracao por Wi-Fi do Android.
+	var cmds []string
+	for regra, prog := range map[string]string{regraFirewall: exe, regraFirewall + " (adb)": adbExe} {
+		if prog == "" {
+			continue
+		}
+		atual, _ := oculto("netsh", "advfirewall", "firewall", "show", "rule", "name="+regra, "verbose").CombinedOutput()
+		if !strings.Contains(strings.ToLower(string(atual)), strings.ToLower(prog)) {
+			cmds = append(cmds, fmt.Sprintf(`netsh advfirewall firewall delete rule name="%[1]s" & `+
+				`netsh advfirewall firewall add rule name="%[1]s" dir=in action=allow program="%[2]s" profile=private,domain`, regra, prog))
+		}
+	}
+	if len(cmds) > 0 {
+		logf("criando/atualizando regras de firewall (pede admin)")
+		cmds = append(cmds, fmt.Sprintf(`netsh advfirewall firewall delete rule name="%s"`, regraAntiga))
+		windows.ShellExecute(0, ptr("runas"), ptr("cmd"), ptr("/c "+strings.Join(cmds, " & ")), nil, windows.SW_HIDE)
 	}
 	return exe, nil
 }
@@ -603,18 +703,18 @@ func ipsLocais() string {
 	return strings.Join(ips, ",")
 }
 
-// extrairBundle descompacta o zip embutido numa pasta com o hash dele no nome; se a pasta ja
+// extrairBundle descompacta um zip embutido numa pasta com o hash dele no nome; se a pasta ja
 // estiver completa (arquivo .ok), reaproveita. Versao nova do app = pasta nova.
-func extrairBundle() (string, error) {
-	h := sha256.Sum256(bundleZip)
-	dir := filepath.Join(dirApp, "uxplay-"+hex.EncodeToString(h[:6]))
+func extrairBundle(nome string, dados []byte) (string, error) {
+	h := sha256.Sum256(dados)
+	dir := filepath.Join(dirApp, nome+"-"+hex.EncodeToString(h[:6]))
 	ok := filepath.Join(dir, ".ok")
 	if _, err := os.Stat(ok); err == nil {
 		return dir, nil
 	}
-	logf("extraindo UxPlay para %s", dir)
+	logf("extraindo %s para %s", nome, dir)
 	os.RemoveAll(dir)
-	zr, err := zip.NewReader(bytes.NewReader(bundleZip), int64(len(bundleZip)))
+	zr, err := zip.NewReader(bytes.NewReader(dados), int64(len(dados)))
 	if err != nil {
 		return "", err
 	}
@@ -650,7 +750,7 @@ func extrairArquivo(f *zip.File, dest string) error {
 	return err
 }
 
-// prenderAoJob faz o Windows matar o UxPlay junto se este app fechar de qualquer jeito.
+// prenderAoJob faz o Windows matar o UxPlay/scrcpy junto se este app fechar de qualquer jeito.
 func prenderAoJob(cmd *exec.Cmd) {
 	if job == 0 {
 		h, err := windows.CreateJobObject(nil, nil)
@@ -670,7 +770,7 @@ func prenderAoJob(cmd *exec.Cmd) {
 }
 
 func aviso(msg string) {
-	windows.MessageBox(0, ptr(msg), ptr("iPhone Screenshare"), windows.MB_OK|windows.MB_ICONWARNING)
+	windows.MessageBox(0, ptr(msg), ptr("Phone Screenshare"), windows.MB_OK|windows.MB_ICONWARNING)
 }
 
 func ptr(s string) *uint16 {
