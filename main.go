@@ -65,13 +65,14 @@ type Device struct {
 }
 
 type Config struct {
-	Name       string            `json:"name"`       // the one name in Screen Mirroring
-	MaxSlots   int               `json:"maxSlots"`   // max devices at once (1 to 8)
-	Resolution string            `json:"resolution"` // "native", "fhd", "hd" or "sd"
-	FPS        int               `json:"fps"`        // 60 or 30
-	UxPlay     string            `json:"uxplay"`     // path to another uxplay.exe; empty = the embedded one
-	ExtraArgs  []string          `json:"extraArgs"`  // e.g. ["-reset", "30"]; added last, so they override the app's
-	Devices    map[string]Device `json:"devices"`    // deviceID -> remembered device
+	Name       string            `json:"name"`             // the one name in Screen Mirroring
+	MaxSlots   int               `json:"maxSlots"`         // max devices at once (1 to 8)
+	Resolution string            `json:"resolution"`       // "native", "fhd", "hd" or "sd"
+	FPS        int               `json:"fps"`              // 60 or 30
+	UxPlay     string            `json:"uxplay"`           // path to another uxplay.exe; empty = the embedded one
+	ExtraArgs  []string          `json:"extraArgs"`        // e.g. ["-reset", "30"]; added last, so they override the app's
+	Devices    map[string]Device `json:"devices"`          // deviceID -> remembered device
+	WakeBlack  int               `json:"wakeBlackSeconds"` // the window stays black this long after the device's screen comes back on (lock screen); 0 to 60
 }
 
 // legacyConfig holds the keys of earlier versions (Portuguese, then slot bindings); they are
@@ -155,6 +156,7 @@ var (
 	saveGen      int               // bumped by every saveConfig, to know whether a write saved the latest
 	diskCfg      = defaultConfig() // config as last read from or written to config.json (merge base)
 	crashWarned  bool              // crash loop popup already shown; reset on Restart or a settings change
+	blackAll     bool              // "Black screen" in the tray: every video window is hidden
 )
 
 // Slot is one UxPlay instance of the pool, with its own ports and MAC (the name is the same for
@@ -185,6 +187,8 @@ type Slot struct {
 	title        string    // window title of the session (the device's display name, unique)
 	connected    time.Time // when it was accepted
 	mirroring    bool      // UxPlay is receiving video (from the log)
+	asleep       bool      // the device's screen is off: the window would freeze on its last frame (patched UxPlay: "privacy: video paused")
+	wokeAt       time.Time // when the device's screen came back on; the window stays black cfg.WakeBlack after it
 	videoStart   time.Time // when video started
 	ended        time.Time // when the last mirroring session ended
 	width        int       // source video size from the last geometry line
@@ -214,7 +218,7 @@ type Slot struct {
 }
 
 func defaultConfig() Config {
-	return Config{Name: "LIVE", MaxSlots: slotLimit, Resolution: "native", FPS: 60, ExtraArgs: []string{}, Devices: map[string]Device{}}
+	return Config{Name: "LIVE", MaxSlots: slotLimit, Resolution: "native", FPS: 60, ExtraArgs: []string{}, Devices: map[string]Device{}, WakeBlack: 10}
 }
 
 // idleAt tells whether the slot can be restarted or stopped without dropping anyone: nobody
@@ -239,6 +243,31 @@ func (s *Slot) busyAt(now time.Time) bool { return s.active && !s.idleAt(now) }
 // (frozen on the last frame) and state belong to that session, so it restarts before serving
 // another device. Once advertised again, UxPlay serves the next device as it is. Call with mu held.
 func (s *Slot) used() bool { return s.cmd != nil && s.deviceID != "" && !s.readvertised }
+
+// privateAt tells whether the slot's video window must not be seen (made transparent, so OBS gets
+// nothing): Black screen is on, nobody is mirroring (the window would hold the last frame frozen),
+// the device's screen is off (frozen too, often on the lock screen), or it came back on less than
+// cfg.WakeBlack ago (the lock screen and passcode keypad show live until it is unlocked). Call with
+// mu held.
+func (s *Slot) privateAt(now time.Time) bool {
+	return blackAll || !s.mirroring || s.asleep || now.Sub(s.wokeAt) < time.Duration(cfg.WakeBlack)*time.Second
+}
+
+// privacyNote says why a live session's window is black, for the tray line; empty if it isn't.
+// Call with mu held.
+func (s *Slot) privacyNote(now time.Time) string {
+	switch {
+	case !s.mirroring:
+		return ""
+	case blackAll:
+		return "black screen"
+	case s.asleep:
+		return "screen off: black"
+	case s.privateAt(now):
+		return "just woke: black"
+	}
+	return ""
+}
 
 // orientation describes the source video, e.g. "portrait 1320×2868"; empty if unknown.
 func orientation(w, h int) string {
@@ -584,6 +613,7 @@ func parseConfig(b []byte) (Config, []string, error) {
 		notes = append(notes, migratedNote)
 	}
 	n.MaxSlots = min(max(n.MaxSlots, 1), slotLimit)
+	n.WakeBlack = min(max(n.WakeBlack, 0), 60)
 	if n.ExtraArgs == nil {
 		n.ExtraArgs = []string{}
 	}
@@ -1009,6 +1039,7 @@ func onReady() {
 		fpsItems[f] = mFPS.AddSubMenuItemCheckbox(strconv.Itoa(f), "", false)
 	}
 	syncChecks()
+	mBlack := systray.AddMenuItemCheckbox("Black screen", "hide every video window from the screen and OBS", false)
 	systray.AddSeparator()
 	mRestart := systray.AddMenuItem("Restart", "")
 	mLog := systray.AddMenuItem("Open log", "")
@@ -1041,6 +1072,11 @@ func onReady() {
 	go func() {
 		for {
 			select {
+			case <-mBlack.ClickedCh:
+				mu.Lock()
+				on := !blackAll
+				mu.Unlock()
+				setBlackAll(on, mBlack)
 			case <-mRestart.ClickedCh:
 				if reloadConfig() { // a config that didn't load changes nothing: keep live sessions
 					restartAll()
@@ -1161,6 +1197,9 @@ func slotLine(s *Slot) string {
 		}
 		if s.fps > 0 {
 			t += fmt.Sprintf(" · %.0f fps", s.fps)
+		}
+		if p := s.privacyNote(time.Now()); p != "" {
+			t += " · " + p
 		}
 	}
 	if p := pendingNote(s); p != "" {
@@ -1601,6 +1640,18 @@ func (s *Slot) processLine(line string, now time.Time) (msg string, accepted, ke
 	}
 	keep = true
 	switch {
+	case strings.Contains(line, "privacy: video paused"):
+		if !s.mirroring || s.asleep {
+			return "", false, true
+		}
+		s.asleep = true
+		return fmt.Sprintf("slot %d: %s screen off: window black", s.N, s.title), false, true
+	case strings.Contains(line, "privacy: video resumed"):
+		if !s.asleep {
+			return "", false, true
+		}
+		s.asleep, s.wokeAt = false, now
+		return fmt.Sprintf("slot %d: %s screen on: window black for %d s more (lock screen)", s.N, s.title, cfg.WakeBlack), false, true
 	case strings.Contains(line, "mDNS: hidden while mirroring"):
 		s.hidden = true
 		return fmt.Sprintf("slot %d: out of Screen Mirroring while %s mirrors", s.N, s.title), false, true
@@ -1716,6 +1767,7 @@ func (s *Slot) accept(now time.Time) string {
 	}
 	s.sock, s.device, s.deviceID, s.connected, s.readvertised = s.candSock, device, id, now, false
 	s.width, s.height, s.codec, s.fps, s.plistShown = 0, 0, "", 0, false
+	s.asleep, s.wokeAt = false, time.Time{}
 	s.state, s.color = "connecting", "yellow"
 	open := map[string]string{}
 	for _, o := range slots {
@@ -1747,11 +1799,15 @@ func readOutput(s *Slot, r io.Reader, done chan<- struct{}) {
 		line := sc.Text()
 		mu.Lock()
 		before := [6]any{s.state, s.width, s.height, s.codec, math.Round(s.fps), s.title}
-		size := [2]int{s.width, s.height}
+		size, wasPrivate := [2]int{s.width, s.height}, s.privateAt(time.Now())
 		msg, accepted, keep := s.processLine(line, time.Now())
 		changed := before != [6]any{s.state, s.width, s.height, s.codec, math.Round(s.fps), s.title}
 		resized := size != [2]int{s.width, s.height} && s.width > 0 && s.height > 0
+		hide := !wasPrivate && s.privateAt(time.Now())
 		mu.Unlock()
+		if hide {
+			curtainSlot(s) // right away; watchWindows also keeps it every second
+		}
 		if keep {
 			fmt.Fprintf(logFile, "[slot %d] %s\n", s.N, line)
 		}
@@ -1761,7 +1817,7 @@ func readOutput(s *Slot, r io.Reader, done chan<- struct{}) {
 		if msg != "" {
 			logf("%s", msg)
 		}
-		if changed || accepted {
+		if changed || accepted || hide {
 			updateMenu(s)
 		}
 		if accepted {
@@ -1926,6 +1982,14 @@ func watchWindows() {
 			}
 			fitWindows(s, wins, time.Now())
 			mu.Lock()
+			private := s.privateAt(time.Now())
+			mu.Unlock()
+			for _, h := range wins {
+				if isVideoWindow(h) {
+					setCurtain(h, private)
+				}
+			}
+			mu.Lock()
 			now := time.Now()
 			switch {
 			case s.mirroring && len(wins) == 0 && now.Sub(s.videoStart) > 5*time.Second:
@@ -2046,15 +2110,19 @@ func onWindowEvent(h windows.HWND, shown bool) {
 	var s *Slot
 	var video [2]int
 	var title string
+	var private bool
 	mu.Lock()
 	for _, o := range slots {
 		if o.active && o.cmd != nil && o.cmd.Process != nil && uint32(o.cmd.Process.Pid) == pid {
-			s, video, title = o, [2]int{o.width, o.height}, o.title
+			s, video, title, private = o, [2]int{o.width, o.height}, o.title, o.privateAt(time.Now())
 		}
 	}
 	mu.Unlock()
 	if s == nil || !isVideoWindow(h) {
 		return // tooltips (the close button's), IME and tool windows are left alone
+	}
+	if shown && private {
+		setCurtain(h, true) // before any reveal below: it keeps a curtained window transparent
 	}
 	if style, _, _ := getWindowLongPtr.Call(uintptr(h), gwlStyle); style&wsCaption == 0 {
 		if shown {
@@ -2127,6 +2195,9 @@ var (
 	// transparent holds the video windows made transparent at creation, until their fit at show has
 	// landed, and whether revealStale already saw them visible. Guarded by fitMu.
 	transparent = map[windows.HWND]bool{}
+	// curtained holds the video windows made transparent because their session is private
+	// (privateAt). revealWindow leaves them transparent. Guarded by fitMu.
+	curtained = map[windows.HWND]bool{}
 )
 
 func windowClass(h windows.HWND) string {
@@ -2159,15 +2230,80 @@ func hideWindow(h windows.HWND) {
 	fitMu.Unlock()
 }
 
-// revealWindow undoes hideWindow, if it hid the window.
+// revealWindow undoes hideWindow, if it hid the window and it isn't curtained.
 func revealWindow(h windows.HWND) {
 	fitMu.Lock()
 	_, ok := transparent[h]
 	delete(transparent, h)
+	keep := curtained[h]
 	fitMu.Unlock()
-	if ok {
+	if ok && !keep {
 		ex, _, _ := getWindowLongPtr.Call(uintptr(h), gwlExStyle)
 		setWindowLongPtr.Call(uintptr(h), gwlExStyle, ex&^wsExLayered)
+	}
+}
+
+// setCurtain makes a visible video window transparent (on) or shows it again (off), the same way
+// hideWindow does: the video sink keeps rendering, the screen and OBS get nothing. A window still
+// transparent from hideWindow only gets marked, and revealWindow then leaves it transparent.
+func setCurtain(h windows.HWND, on bool) {
+	const lwaAlpha = 2
+	fitMu.Lock()
+	was := curtained[h]
+	_, fitting := transparent[h]
+	if on {
+		curtained[h] = true
+	} else {
+		delete(curtained, h)
+	}
+	fitMu.Unlock()
+	if on == was || fitting {
+		return
+	}
+	ex, _, _ := getWindowLongPtr.Call(uintptr(h), gwlExStyle)
+	if !on {
+		setWindowLongPtr.Call(uintptr(h), gwlExStyle, ex&^wsExLayered)
+		return
+	}
+	setWindowLongPtr.Call(uintptr(h), gwlExStyle, ex|wsExLayered)
+	if r, _, err := setLayeredWinAttr.Call(uintptr(h), 0, 0, lwaAlpha); r == 0 {
+		fitMu.Lock()
+		delete(curtained, h) // tried again on the next tick
+		fitMu.Unlock()
+		logf("could not black out window %q: %v", windowTitle(h), err)
+	}
+}
+
+// curtainSlot applies privateAt to the slot's video windows now, instead of on watchWindows' next tick.
+func curtainSlot(s *Slot) {
+	mu.Lock()
+	cmd, private := s.cmd, s.privateAt(time.Now())
+	mu.Unlock()
+	if cmd == nil || cmd.Process == nil {
+		return
+	}
+	for _, h := range visibleWindows()[uint32(cmd.Process.Pid)] {
+		if isVideoWindow(h) {
+			setCurtain(h, private)
+		}
+	}
+}
+
+// setBlackAll turns Black screen on or off: every video window hidden, whatever the session.
+func setBlackAll(on bool, item *systray.MenuItem) {
+	mu.Lock()
+	blackAll = on
+	mu.Unlock()
+	if on {
+		item.Check()
+		logf("black screen on: every video window hidden")
+	} else {
+		item.Uncheck()
+		logf("black screen off")
+	}
+	for _, s := range slots {
+		curtainSlot(s)
+		updateMenu(s)
 	}
 }
 
@@ -2176,6 +2312,11 @@ func revealWindow(h windows.HWND) {
 func revealStale() {
 	var stale []windows.HWND
 	fitMu.Lock()
+	for h := range curtained {
+		if !windowExists(h) {
+			delete(curtained, h)
+		}
+	}
 	for h, seen := range transparent {
 		switch {
 		case !windowExists(h):

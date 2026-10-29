@@ -38,6 +38,13 @@ grep -q 'mDNS: mirroring ended, advertised again' src/uxplay.cpp
 grep -q 'mDNS: advertised at startup' src/uxplay.cpp
 # Unbuffered log: the app reads "connection request ... deviceID" right away to bind the device to its slot.
 sed -i 's/^int main (int argc, char \*argv\[\]) {$/&\n    setvbuf(stdout, NULL, _IONBF, 0);/' src/uxplay.cpp
+# Privacy lines: the device's screen went off (AirPlay's "video stream stops, client sleeps" packet:
+# the window would freeze on the last frame, often the lock screen) or came back on. The app keeps the
+# video window black meanwhile and for a few seconds after waking (lock screen, passcode keypad).
+sed -i 's/^extern "C" void video_pause (void \*cls) {$/&\n    LOGI("privacy: video paused, device asleep");/' src/uxplay.cpp
+sed -i 's/^extern "C" void video_resume (void \*cls) {$/&\n    LOGI("privacy: video resumed, device awake");/' src/uxplay.cpp
+grep -q 'privacy: video paused' src/uxplay.cpp
+grep -q 'privacy: video resumed' src/uxplay.cpp
 grep -c '_IONBF' src/uxplay.cpp
 cmake -S src -B obj -G Ninja -DCMAKE_BUILD_TYPE=Release   # no -DUSE_DNS_SD: uses lib/mdnsd
 ninja -C obj

@@ -9,7 +9,8 @@
 #    MAC, no -restrict/-block/-nohold), the patch's mDNS line read, the client's fps read and only
 #    the first FPS report in the log, the codec and source geometry/rotation read from the log, the
 #    video window already in the video's shape the first time it becomes visible and fitted again on
-#    rotation, and the close button's tooltip window left alone (not renamed, not resized); then the
+#    rotation, and the close button's tooltip window left alone (not renamed, not resized), the
+#    window hidden while the device's screen is off and shown again after waking; then the
 #    device stops mirroring (only the patch's "mirroring ended, advertised again" line says so):
 #    the instance is back in Screen Mirroring and becomes the one free instance without a restart,
 #    and slot 2 goes down.
@@ -38,7 +39,10 @@ $exeText = [Text.Encoding]::ASCII.GetString([IO.File]::ReadAllBytes("$b\bin\uxpl
 foreach ($s in 'mDNS: advertised at startup', 'mDNS: hidden while mirroring', 'mDNS: mirroring ended, advertised again') {
   if (-not $exeText.Contains($s)) { throw "uxplay.exe without the pool patch (no '$s')" }
 }
-Write-Host 'uxplay.exe: pool patch present'
+foreach ($s in 'privacy: video paused', 'privacy: video resumed') {
+  if (-not $exeText.Contains($s)) { throw "uxplay.exe without the privacy lines (no '$s')" }
+}
+Write-Host 'uxplay.exe: pool patch and privacy lines present'
 
 function Wait-UxPlay([int]$seconds, [int]$count = 1) {
   Start-Sleep -Seconds $seconds
@@ -95,7 +99,8 @@ $env:LOCALAPPDATA = "$env:RUNNER_TEMP\appfake"
 $dir = "$env:LOCALAPPDATA\iPhoneScreenshareServer"
 New-Item -ItemType Directory -Force $dir | Out-Null
 Remove-Item "$fake.session" -ErrorAction SilentlyContinue  # the fake simulates one session per run
-[IO.File]::WriteAllText("$dir\config.json", (@{ maxSlots = 8; uxplay = $fake } | ConvertTo-Json))
+# wakeBlackSeconds 1: the fake checks its window 3 s after waking, when it must be shown again.
+[IO.File]::WriteAllText("$dir\config.json", (@{ maxSlots = 8; uxplay = $fake; wakeBlackSeconds = 1 } | ConvertTo-Json))
 $app = Start-Process 'dist/iPhoneScreenshareServer.exe' -PassThru
 function Wait-AppLog([string]$pattern, [int]$seconds) {
   $deadline = (Get-Date).AddSeconds($seconds)
@@ -105,7 +110,8 @@ function Wait-AppLog([string]$pattern, [int]$seconds) {
   }
 }
 try {
-  # The fake reports its tooltip about 22 s after it starts; its session ends at 28 s.
+  # The fake reports its tooltip about 22 s after it starts, its screen goes off and back on in the
+  # next 5 s, and its session ends at 32 s.
   Wait-AppLog 'FAKE: titles' 45
   $procs = @(Get-Process uxplay -ErrorAction SilentlyContinue)
   $windows = @($procs | ForEach-Object MainWindowTitle)
@@ -164,7 +170,17 @@ try {
   if ($errors) { throw ($errors -join '; ') }
   Write-Host 'fake uxplay: one free LIVE, device-named window, tooltip left alone, fps, mDNS line, MACs, codec, geometry, fit on rotation OK'
 
-  # The fake's device stops mirroring 28 s after its start and slot 1 announces itself again: the
+  # Privacy: while the device's screen is off the window is transparent (OBS gets nothing, not the
+  # frozen lock screen), and it shows again once wakeBlackSeconds after waking is over.
+  Wait-AppLog 'FAKE: awake transparent' 15
+  $l = Get-Content "$dir\app.log" -Encoding UTF8
+  if (-not ($l -match 'slot 1: CI iPhone screen off: window black')) { $errors += 'screen off not read' }
+  if (-not ($l -match 'FAKE: asleep transparent=1')) { $errors += "window not hidden while the device's screen is off" }
+  if (-not ($l -match 'FAKE: awake transparent=0')) { $errors += 'window not shown again after waking' }
+  if ($errors) { throw ($errors -join '; ') }
+  Write-Host 'privacy: window hidden while the screen is off, shown again after waking OK'
+
+  # The fake's device stops mirroring 32 s after its start and slot 1 announces itself again: the
   # devices now resolve LIVE to it, so 5 s later it is the free LIVE, without a restart, and slot 2
   # (the other idle one) goes down.
   Wait-AppLog 'slot 2: down, not needed' 30

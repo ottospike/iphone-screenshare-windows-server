@@ -117,13 +117,14 @@ audio app that OBS can capture:
 | `LIVE · waiting` | The free instance, for the next device |
 | **Resolution** | Native · FHD · HD · SD, for all instances. Saved; each instance restarts with it once nobody is mirroring on it, so live devices are not dropped |
 | **FPS** | 60 · 30, for all instances. Saved; applied the same way |
+| **Black screen** | Hides every video window from the screen and OBS at once, until you turn it off. See [Privacy](#privacy-lock-screen-and-frozen-frames) |
 | **Restart** | Rereads the config and restarts every instance. If the config has an error or can't be read, nothing restarts and live devices stay connected |
 | **Open log** | App and UxPlay log in Notepad |
 | **Open config** | `config.json` in Notepad |
 | **Quit** | Closes the app and UxPlay |
 
 States: `starting` gray · `waiting` blue · `connecting` yellow · `live` green ·
-`stopped: mirror again on the device` yellow, the window keeps the last frame ·
+`stopped: mirror again on the device` yellow, the window is hidden (it would keep the last frame) ·
 `receiving video but no window` yellow · `reconnecting` yellow, UxPlay crashed and is coming back ·
 `start error` / `stopped: crashed 3 times` red.
 
@@ -163,7 +164,7 @@ instance with the new settings; tap LIVE again on the device. **Restart** applie
 | What happens | What the app does |
 |---|---|
 | Device Wi-Fi blips | Mirror again to LIVE on the device. The free instance takes it, with the same window title, and the old instance restarts at once |
-| Device disappears without notice | UxPlay drops the session after 15 s without response and the instance is LIVE again; its window may keep the last frame, under the device's name, until another device connects to it, or the instance restarts when the same device reconnects on another one |
+| Device disappears without notice | UxPlay drops the session after 15 s without response and the instance is LIVE again; its window, hidden (it would keep the last frame), may stay open under the device's name, until another device connects to it, or the instance restarts when the same device reconnects on another one |
 | UxPlay exits or crashes | Restarts in 2 s. If it crashes 3 times in a row right after starting, it stops and warns once, to avoid a loop: check the log, then change **Resolution** or **FPS**, which starts the stopped instances again, or use **Restart** |
 | PC network changes: cable/Wi-Fi back, new IP | Restarts the instances nobody is mirroring on, so they announce on the new network. Live ones continue |
 | PC resumes from sleep | Same |
@@ -172,6 +173,24 @@ instance with the new settings; tap LIVE again on the device. **Restart** applie
 No receiver can make the device resume mirroring by itself: when mirroring drops, the device ends
 it on its side. Tap **Screen Mirroring → LIVE** again; its window comes back with the same title,
 on the same OBS source.
+
+## Privacy: lock screen and frozen frames
+
+When the device's screen goes off (Auto-Lock, side button), AirPlay stops sending video but keeps the
+session, and the window would freeze on the last frame, often the lock screen. When it wakes, the
+lock screen and the passcode keypad would show live, with each key flashing as it is tapped. So the
+app hides the video window (fully transparent: the screen and OBS get nothing, the OBS source shows
+what is behind it, black on an empty scene):
+
+- while the device's screen is off: the line in the tray says `screen off: black`;
+- for `wakeBlackSeconds` (10 s by default) after it comes back on, to cover the unlock: `just woke: black`;
+- whenever nobody is mirroring on that window (the session ended or dropped: its last frame is frozen);
+- while **Black screen** is on in the tray, for every device, to hide everything by hand at any time.
+
+The screen-off and screen-on signals come from AirPlay itself (UxPlay is patched to log them), so
+this works without guessing from the picture. For no gap at all, keep the device from locking during
+the show: **Settings → Display & Brightness → Auto-Lock → Never**, and, to keep the side button from
+locking it, **Guided Access** with the side button disabled.
 
 ## Config
 
@@ -196,6 +215,7 @@ never leaves it cut off, and a copy of the last save is kept in `config.json.bak
   "fps": 60,
   "uxplay": "",
   "extraArgs": [],
+  "wakeBlackSeconds": 10,
   "devices": {
     "22:C5:83:7E:F0:3F": { "name": "Otavio Augusto’s iPhone", "label": "", "window": "Otavio Augusto’s iPhone" },
     "AA:BB:CC:DD:EE:FF": { "name": "iPhone", "label": "Player 2", "window": "Player 2" }
@@ -211,6 +231,7 @@ never leaves it cut off, and a copy of the last save is kept in `config.json.bak
 | `fps` | `60` or `30` |
 | `uxplay` | Path to another `uxplay.exe`. Empty = the embedded one. It needs the pool patch to hide busy instances |
 | `extraArgs` | Extra UxPlay options for every instance, added last so they override the app's. E.g. `["-reset", "30"]` to tolerate 30 s without response before dropping the session |
+| `wakeBlackSeconds` | How long the window stays black after the device's screen comes back on (lock screen, passcode), 0 to 60. Default 10. See [Privacy](#privacy-lock-screen-and-frozen-frames) |
 | `devices` | Remembered devices, by the `deviceID` they send over AirPlay. Filled by the app: `name` is what the device sends, `window` the window title it got (kept so it never changes). Set `label` to name the device yourself, e.g. `"Player 2"`: it replaces the name in the window title and the tray from its next connection, so re-point its OBS source once. Deleting an entry, or **Forget device**, frees its title |
 
 Configs of earlier versions are converted automatically. v0.2.0's slot `bindings` become
@@ -229,7 +250,8 @@ and `hd`, and an unknown value becomes `native`.
 
 - PC on **Ethernet**; devices on the **5 GHz** Wi-Fi of the same router.
 - If another phone is the camera (Iriun etc.), connect it over **USB** so it doesn't share the Wi-Fi.
-- On the mirrored device: **Do Not Disturb** on and Auto-Lock off.
+- On the mirrored device: **Do Not Disturb** on and Auto-Lock **Never** (the window goes black while
+  the screen is off and right after it wakes; see [Privacy](#privacy-lock-screen-and-frozen-frames)).
 
 ## Troubleshooting
 

@@ -1442,3 +1442,74 @@ func TestCutFPSReportDoesNotHideLines(t *testing.T) {
 		t.Fatalf("the end of mirroring was taken as part of the report: %q keep=%v", msg, keep)
 	}
 }
+
+// The patched UxPlay's privacy lines: the window is black while the device's screen is off and
+// cfg.WakeBlack after it comes back on (lock screen, passcode keypad), and whenever nobody mirrors.
+func TestPrivacyScreenOff(t *testing.T) {
+	withConfig(t, testConfig(map[string]Device{}))
+	withSlots(t, 1)
+	s := slots[0]
+	s.cmd = &exec.Cmd{}
+	t0 := time.Now()
+	if !s.privateAt(t0) {
+		t.Fatalf("nobody mirroring: a frozen window must be black")
+	}
+	connect(s, realLine, t0)
+	s.processLine("Begin streaming to GStreamer video pipeline", t0)
+	if s.privateAt(t0) || strings.Contains(slotLine(s), "black") {
+		t.Fatalf("live session hidden: %q", slotLine(s))
+	}
+	msg, _, keep := s.processLine("privacy: video paused, device asleep", t0)
+	if !s.asleep || !keep || msg != "slot 1: Otavio Augusto’s iPhone screen off: window black" ||
+		!s.privateAt(t0.Add(time.Hour)) || !strings.Contains(slotLine(s), "screen off: black") {
+		t.Fatalf("screen off: %q asleep %v line %q", msg, s.asleep, slotLine(s))
+	}
+	if msg, _, _ := s.processLine("privacy: video paused, device asleep", t0); msg != "" {
+		t.Fatalf("a repeated pause line: %q", msg)
+	}
+	t1 := t0.Add(time.Minute)
+	msg, _, _ = s.processLine("privacy: video resumed, device awake", t1)
+	if s.asleep || !strings.Contains(msg, "black for 10 s more") ||
+		!s.privateAt(t1.Add(9*time.Second)) || s.privateAt(t1.Add(10*time.Second)) {
+		t.Fatalf("woke: %q asleep %v", msg, s.asleep)
+	}
+	if msg, _, _ := s.processLine("privacy: video resumed, device awake", t1); msg != "" || !s.wokeAt.Equal(t1) {
+		t.Fatalf("a resume without a pause must not restart the wait: %q", msg)
+	}
+	cfg.WakeBlack = 0
+	if s.privateAt(t1) {
+		t.Fatalf("wakeBlackSeconds 0: shown right when it wakes")
+	}
+	cfg.WakeBlack = 10
+
+	blackAll = true
+	t.Cleanup(func() { blackAll = false })
+	if !s.privateAt(t1.Add(time.Hour)) || !strings.Contains(slotLine(s), "black screen") {
+		t.Fatalf("Black screen on: %q", slotLine(s))
+	}
+	blackAll = false
+
+	// A new session starts awake.
+	s.processLine("privacy: video paused, device asleep", t1)
+	s.processLine("raop_rtp_mirror->running is no longer true", t1)
+	if !s.privateAt(t1) {
+		t.Fatalf("session over: the frozen window must stay black")
+	}
+	connect(s, realLine, t1.Add(time.Minute))
+	if s.asleep || !s.wokeAt.IsZero() {
+		t.Fatalf("new session kept the old one's sleep: asleep %v woke %v", s.asleep, s.wokeAt)
+	}
+	// A pause line without a session (nobody mirroring) changes nothing.
+	if msg, _, _ := s.processLine("privacy: video paused, device asleep", t1); msg != "" || s.asleep {
+		t.Fatalf("pause without a session: %q", msg)
+	}
+}
+
+func TestParseConfigWakeBlack(t *testing.T) {
+	for in, want := range map[string]int{`{}`: 10, `{"wakeBlackSeconds": 3}`: 3, `{"wakeBlackSeconds": 999}`: 60, `{"wakeBlackSeconds": -5}`: 0} {
+		n, _, err := parseConfig([]byte(in))
+		if err != nil || n.WakeBlack != want {
+			t.Fatalf("%s: wakeBlackSeconds %d, want %d (%v)", in, n.WakeBlack, want, err)
+		}
+	}
+}

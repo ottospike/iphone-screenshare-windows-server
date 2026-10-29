@@ -6,7 +6,7 @@
 //   - on the first instance (ports 35010, "-p 35010"), once, it simulates a device that connects, is
 //     accepted and starts mirroring, with the window showing up only a few seconds after the
 //     accept, then rotates to landscape; it prints the patch's "mDNS: hidden while mirroring" and
-//     the client's FPS reports (-FPSdata: a plist in XML once a second); 28 s after starting the
+//     the client's FPS reports (-FPSdata: a plist in XML once a second); 32 s after starting the
 //     device's mirror stream closes (a line the app doesn't take as an end by itself) and the
 //     instance prints the patch's "mDNS: mirroring ended, advertised again";
 //   - creates its window like d3d11videosink: hidden, then on the "first frame" sized to the full
@@ -17,6 +17,9 @@
 //   - like GStreamer's close button, opens a tooltip window ("tooltips_class32") owned by the video
 //     window, and later prints both windows' titles and the tooltip's size ("FAKE: titles ..."):
 //     the app must rename and fit only the video window;
+//   - after that, the device's screen goes off and back on (the patch's "privacy: video paused" and
+//     "privacy: video resumed"), and it prints whether its window is transparent each time
+//     ("FAKE: asleep transparent=1", then "FAKE: awake transparent=0" once wakeBlackSeconds is over);
 //   - the other instances just stay up, like UxPlay waiting for a device.
 package main
 
@@ -139,7 +142,7 @@ func main() {
 		fmt.Println("*** codec is h264: geometry is (w,h)=(2868,1320) (source); (w,h)=(2868,1320) (displayed)")
 	}()
 	go func() {
-		time.Sleep(28*time.Second - time.Since(start)) // after the smoke test's first look
+		time.Sleep(32*time.Second - time.Since(start)) // after the smoke test's first look and the privacy check
 		// Only the patch line tells the app that the session is over.
 		fmt.Println("raop_rtp_mirror tcp socket was closed by client (recv returned 0)")
 		fmt.Println("mDNS: mirroring ended, advertised again")
@@ -180,17 +183,18 @@ func openWindow(title string, vw, vh int32) {
 	t, _ := windows.UTF16PtrFromString(title)
 	shown, seen := false, false
 	var tip uintptr
-	report := func(h windows.HWND) {
-		if !shown || seen {
-			return
-		}
+	transparent := func(h windows.HWND) bool {
 		if ex, _, _ := getWindowLongPtr.Call(uintptr(h), gwlExStyle); ex&wsExLayered != 0 {
 			var alpha byte
 			var flags uint32
 			r, _, _ := getLayeredAttr.Call(uintptr(h), 0, uintptr(unsafe.Pointer(&alpha)), uintptr(unsafe.Pointer(&flags)))
-			if r != 0 && flags&lwaAlpha != 0 && alpha == 0 {
-				return // transparent: not seen
-			}
+			return r != 0 && flags&lwaAlpha != 0 && alpha == 0
+		}
+		return false
+	}
+	report := func(h windows.HWND) {
+		if !shown || seen || transparent(h) { // transparent: not seen
+			return
 		}
 		seen = true
 		w, hh := clientSize(uintptr(h))
@@ -236,6 +240,14 @@ func openWindow(title string, vw, vh int32) {
 			case 3:
 				tw, th := clientSize(tip)
 				fmt.Printf("FAKE: titles video=%q tooltip=%q tooltip size %dx%d\n", text(uintptr(h)), text(tip), tw, th)
+				fmt.Println("privacy: video paused, device asleep")
+				setTimer.Call(uintptr(h), 4, 2000, 0)
+			case 4:
+				fmt.Printf("FAKE: asleep transparent=%d\n", map[bool]int{false: 0, true: 1}[transparent(h)])
+				fmt.Println("privacy: video resumed, device awake")
+				setTimer.Call(uintptr(h), 5, 3000, 0)
+			case 5:
+				fmt.Printf("FAKE: awake transparent=%d\n", map[bool]int{false: 0, true: 1}[transparent(h)])
 			}
 			return 0
 		}
